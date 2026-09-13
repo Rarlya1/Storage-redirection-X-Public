@@ -3032,21 +3032,32 @@
       path_mappings: {},
     };
   }
+  // 与 App 端 sanitizeConfigPath 保持一致：统一去掉尾斜杠并合并由此产生的重复项。
+  function normalizeConfigPathEntry(value) {
+    return String(value || "")
+      .trim()
+      .replace(/\/+$/, "");
+  }
+  function cleanConfigPathList(paths) {
+    const source = Array.isArray(paths) ? paths : typeof paths === "string" ? [paths] : [];
+    return sortPathRules(
+      [...new Set(source.map(normalizeConfigPathEntry))].filter((p) => p && p !== "!"),
+    );
+  }
   function normalizeUsersConfig(users) {
     const out = {};
     Object.keys(users || {}).forEach((id) => {
       const raw = users[id] || {};
       const profile = Object.assign(createDefaultProfile({ enabledDefault: true }), raw);
-      profile.allowed_real_paths = Array.isArray(profile.allowed_real_paths)
-        ? profile.allowed_real_paths
-        : [];
-      profile.excluded_real_paths = Array.isArray(profile.excluded_real_paths)
-        ? profile.excluded_real_paths
-        : [];
-      const readOnlyPaths = normalizeReadOnlyRules(profile.read_only_paths);
+      const readOnlyPaths = cleanConfigPathList(profile.read_only_paths);
       profile.allowed_real_paths = sortPathRules(
         removeConflictingAllowedRules(
-          mergeAllowedRules(profile.allowed_real_paths, profile.excluded_real_paths),
+          mergeAllowedRules(
+            cleanConfigPathList(profile.allowed_real_paths),
+            Array.isArray(profile.excluded_real_paths)
+              ? profile.excluded_real_paths.map(normalizeConfigPathEntry).filter(Boolean)
+              : [],
+          ),
         ),
       );
       profile.excluded_real_paths = [];
@@ -3054,9 +3065,7 @@
         readOnlyPaths,
         profile.allowed_real_paths,
       );
-      profile.sandboxed_paths = sortPathRules(
-        Array.isArray(profile.sandboxed_paths) ? profile.sandboxed_paths : [],
-      );
+      profile.sandboxed_paths = cleanConfigPathList(profile.sandboxed_paths);
       if (!profile.path_mappings || typeof profile.path_mappings !== "object")
         profile.path_mappings = {};
       profile.path_mappings = sortPathMappings(profile.path_mappings);
@@ -3647,7 +3656,8 @@
     });
 
     $("#modalAddBtn")?.addEventListener("click", () => {
-      const rawPath = input.value.trim();
+      // 与 App 端 sanitizeConfigPath 的 .trim('/') 保持一致：保存前去掉尾斜杠。
+      const rawPath = input.value.trim().replace(/\/+$/, "");
       if (!validatePath(rawPath, validateOptions).valid) {
         Theme.showToast("路径格式不正确", "error");
         return;
