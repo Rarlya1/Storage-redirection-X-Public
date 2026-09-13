@@ -4,8 +4,8 @@ use crate::config::{SettingsHub, watcher};
 mod media_hook_heal;
 use crate::daemon_monitor::RegularAppMonitor;
 use crate::daemon_mount::{
-    MountOperation, MountRequest, execute_mount_request, has_healthy_mount_state, has_mount_state,
-    prune_stale_mount_states,
+    MountOperation, MountRequest, cleanup_all_mount_states, execute_mount_request,
+    has_healthy_mount_state, has_mount_state, prune_stale_mount_states,
 };
 use crate::logging::Logger;
 use crate::platform;
@@ -168,6 +168,7 @@ pub fn main_entry() -> i32 {
     log::info!("daemon start");
 
     if !runtime_control::is_module_runtime_enabled() {
+        cleanup_all_mount_states();
         log::info!("daemon exit reason=runtime_disabled");
         return 0;
     }
@@ -193,6 +194,7 @@ pub fn main_entry() -> i32 {
     let mut fallback_file_monitor = file_monitor_sync.is_none().then(RegularAppMonitor::new);
     loop {
         if !runtime_control::is_module_runtime_enabled() {
+            cleanup_all_mount_states();
             log::info!("daemon stop reason=runtime_disabled");
             return 0;
         }

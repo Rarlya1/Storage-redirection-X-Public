@@ -2288,7 +2288,10 @@ const Api = {
           " && touch " +
           shellQuote(RUNTIME_DISABLE) +
           ' && printf "{\\"runtime_disabled\\":true}\\n" > ' +
-          shellQuote(RUNTIME_STATE_CONFIG),
+          shellQuote(RUNTIME_STATE_CONFIG) +
+          " && daemon=" +
+          shellQuote(MODULE_DIR + "/bin/srx_daemon") +
+          '; if [ -x "$daemon" ]; then "$daemon" cleanup-mounts >/dev/null 2>&1 || true; fi',
       ),
     );
     return await this.waitForMediaProviderRestart(beforePids, {

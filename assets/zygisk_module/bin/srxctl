@@ -405,7 +405,10 @@ stop_runtime() {
   chmod 644 "$CONFIG_DIR/runtime_state.json" 2>/dev/null
 
   stop_pid_file "$DAEMON_PID_FILE"
-  pkill -x srx_daemon >/dev/null 2>&1 || true
+  # daemon 已停止或完成自身退出清理后，再处理崩溃遗留的状态文件，避免并发改动同一 namespace。
+  if [ -x "$MODDIR/bin/srx_daemon" ]; then
+    run_bounded 15 "$MODDIR/bin/srx_daemon" cleanup-mounts
+  fi
   stop_collectors
 
   restart_media_provider

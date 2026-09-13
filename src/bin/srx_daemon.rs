@@ -40,7 +40,15 @@ mod runtime_stats;
 fn main() {
     let mut args = std::env::args();
     let _ = args.next();
-    if args.next().as_deref() == Some("control") {
+    let command = args.next();
+    if command.as_deref() == Some("cleanup-mounts") {
+        std::process::exit(if daemon_mount::cleanup_all_mount_states() {
+            0
+        } else {
+            1
+        });
+    }
+    if command.as_deref() == Some("control") {
         let Some(command) = args.next() else {
             eprintln!("usage: srx_daemon control <command>");
             std::process::exit(2);

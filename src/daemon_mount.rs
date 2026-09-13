@@ -111,6 +111,11 @@ fn has_mount_state_internal(request: &MountRequest, check_mount_targets: bool) -
     if std::fs::metadata(&state_path).is_err() {
         return false;
     }
+    // Disable 的目标是清理残留，不能因为 FUSE 子进程或 mountinfo 已经不健康
+    // 就把状态视为不存在，否则坏挂载会永久跳过卸载。
+    if request.operation == MountOperation::Disable {
+        return true;
+    }
     // 记录过 FUSE 服务却已经死掉时，挂载点会留在目标 namespace 里变成 ENOTCONN 死挂载，
     // 应用访问会直接失败。此时把挂载状态视为无效，让周期 reconcile 重新执行挂载；
     // 若 FUSE 再次启动失败，启动阶段的 mount namespace 降级会接管。
@@ -195,9 +200,14 @@ fn backend_mount_targets_responsive(request: &MountRequest) -> bool {
         }
 
         let errno = last_errno();
-        if errno == libc::ENOTCONN {
+        // FUSE 服务退出、后端设备摘除或挂载句柄失效时，内核可能返回不同错误码。
+        // 这些错误都表示当前挂载不再可用，应交给 reconcile 清理后重挂。
+        if matches!(
+            errno,
+            libc::ENOTCONN | libc::EIO | libc::ENODEV | libc::ESTALE
+        ) {
             log::warn!(
-                "daemon backend mount endpoint disconnected pid={} pkg={} target={} errno={} {}",
+                "daemon backend mount endpoint unhealthy pid={} pkg={} target={} errno={} {}",
                 request.pid,
                 request.package_name,
                 target,
@@ -246,7 +256,13 @@ pub fn prune_stale_mount_states() -> usize {
         if is_alive {
             continue;
         }
-        if std::fs::remove_file(&path).is_ok() {
+        let mut cleanup_ok = true;
+        for child in &read_fuse_children(&path.to_string_lossy()) {
+            if !terminate_recorded_fuse_child(child) {
+                cleanup_ok = false;
+            }
+        }
+        if cleanup_ok && std::fs::remove_file(&path).is_ok() {
             removed += 1;
         }
     }
@@ -254,6 +270,80 @@ pub fn prune_stale_mount_states() -> usize {
         log::info!("daemon pruned stale mount states count={}", removed);
     }
     removed
+}
+
+/// 清理所有已记录的 daemon 挂载。
+///
+/// 由 stop 流程在停止 daemon 后调用，使存活应用的 mount namespace
+/// 仍可通过状态文件解析并执行 setns/卸载；清理失败的状态文件会保留，交给后续
+/// daemon 启动后的 reconcile 重试。
+pub fn cleanup_all_mount_states() -> bool {
+    let Ok(entries) = std::fs::read_dir(module_paths::MOUNT_STATE_DIR) else {
+        return true;
+    };
+    let mut all_ok = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("state") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            all_ok = false;
+            continue;
+        };
+        let Some(package_name) = state_value(&content, "package=") else {
+            all_ok = false;
+            continue;
+        };
+        let Some(pid) = state_file_pid(&path, package_name) else {
+            all_ok = false;
+            continue;
+        };
+        let uid = state_value(&content, "uid=")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(-1);
+        let request = MountRequest {
+            operation: MountOperation::Disable,
+            pid,
+            uid,
+            package_name: package_name.to_string(),
+            app_data_dir: String::new(),
+            redirect_target: String::new(),
+            allowed_real_paths: Vec::new(),
+            excluded_real_paths: Vec::new(),
+            path_mappings: Vec::new(),
+            sandboxed_paths: Vec::new(),
+            read_only_paths: Vec::new(),
+            is_mapping_mode_only: false,
+            storage_backend_mode: crate::config::StorageBackendMode::Namespace,
+            is_file_monitor_enabled: false,
+            config_version: 0,
+        };
+        let app_start_time =
+            state_value(&content, "app_start_time=").and_then(|value| value.parse::<u64>().ok());
+        let app_alive = app_start_time
+            .map(|start| crate::platform::is_process_instance_alive(pid, start))
+            .unwrap_or_else(|| std::fs::metadata(format!("/proc/{pid}")).is_ok());
+        if app_alive {
+            if !execute_mount_request(&request) {
+                all_ok = false;
+            }
+        } else {
+            let children = read_fuse_children(&path.to_string_lossy());
+            let mut state_ok = true;
+            for child in &children {
+                if !terminate_recorded_fuse_child(child) {
+                    state_ok = false;
+                }
+            }
+            if state_ok {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                all_ok = false;
+            }
+        }
+    }
+    all_ok
 }
 
 fn state_value<'a>(content: &'a str, prefix: &str) -> Option<&'a str> {
@@ -645,7 +735,8 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
         return false;
     }
 
-    if !clear_previous_mounts(plan) {
+    let cleanup_ok = clear_previous_mounts(plan);
+    if !cleanup_ok {
         log::warn!(
             "daemon mount cleanup incomplete pid={} pkg={}",
             request.pid,
@@ -655,9 +746,9 @@ fn handle_child_process(request: &MountRequest, plan: &MountForkPlan, sock: c_in
     clear_previous_allowed_real_backend_mounts(request);
 
     if request.operation == MountOperation::Disable {
-        let _ = send_mount_result(sock, 0);
+        let _ = send_mount_result(sock, if cleanup_ok { 0 } else { -1 });
         unsafe { close(sock) };
-        return true;
+        return cleanup_ok;
     }
 
     let mut planner = MountPlanner::new(
@@ -908,6 +999,8 @@ fn start_fuse_service_for_root(
     if service_child == 0 {
         unsafe {
             close(ready_sockets[0]);
+            let name = b"srx_fuse\0";
+            libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
         }
         let ok = mount_blocking_with_ready(
             fuse_config_from_request(request, Some(mount_root.to_string()), real_root_override),
@@ -1129,7 +1222,7 @@ fn clear_previous_mounts(plan: &MountForkPlan) -> bool {
     targets.extend(plan.overlay_targets.iter().cloned());
     let targets = module_paths::normalize_mount_targets(&targets);
     if targets.is_empty() && fuse_children.is_empty() {
-        return true;
+        return std::fs::remove_file(state_path).is_ok() || std::fs::metadata(state_path).is_err();
     }
     let mut ok = true;
     for target in targets.iter().rev() {
@@ -1138,9 +1231,13 @@ fn clear_previous_mounts(plan: &MountForkPlan) -> bool {
         }
     }
     for child in &fuse_children {
-        terminate_recorded_fuse_child(child);
+        if !terminate_recorded_fuse_child(child) {
+            ok = false;
+        }
     }
-    let _ = std::fs::remove_file(state_path);
+    if ok && std::fs::remove_file(state_path).is_err() && std::fs::metadata(state_path).is_ok() {
+        ok = false;
+    }
     ok
 }
 
@@ -1606,18 +1703,19 @@ fn read_fuse_children(path: &str) -> Vec<FuseChildIdentity> {
         .collect()
 }
 
-fn terminate_recorded_fuse_child(child: &FuseChildIdentity) {
+fn terminate_recorded_fuse_child(child: &FuseChildIdentity) -> bool {
     let Some(start_time_ticks) = child.start_time_ticks else {
         log::warn!(
             "daemon skip legacy fuse child signal without identity pid={}",
             child.pid
         );
-        return;
+        return false;
     };
     if !crate::platform::is_process_instance_alive(child.pid, start_time_ticks) {
-        return;
+        return true;
     }
     terminate_fuse_child(child.pid);
+    !crate::platform::is_process_instance_alive(child.pid, start_time_ticks)
 }
 
 fn terminate_fuse_child(pid: i32) {
