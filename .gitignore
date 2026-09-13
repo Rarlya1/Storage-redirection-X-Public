@@ -57,6 +57,7 @@ __pycache__/
 # 编辑器与系统文件
 .idea/
 .vscode/
+/.workbuddy/
 *.code-workspace
 .DS_Store
 Thumbs.db
