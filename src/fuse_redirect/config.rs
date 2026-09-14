@@ -1018,19 +1018,32 @@ fn compact_scoped_mount_roots(mut roots: Vec<String>, storage_root: &str) -> Vec
         effective.push(root);
     }
 
-    if effective.len() <= super::MAX_SCOPED_FUSE_ROOTS {
+    if effective.len() <= super::TARGET_SCOPED_FUSE_ROOTS {
         return effective;
     }
 
     // 第二级降级：把各根收敛到其所属的顶层存储子目录（如 Download、DCIM）。
     // 收敛不出顶层子目录（即该根本身就是存储根）的情况直接丢弃，不能让它把
     // 整个存储根带进结果——那等于让模块内 FUSE 接管全部共享存储。
+    //
+    // 这一级的输出上界就是顶层目录个数（public_collection_name 的 12 个公共集合目录
+    // 加 Android 共 13 个），所以硬上限必须不小于它，否则二级接不住就会直接掉进三级的
+    // "放弃 FUSE"分支。一级用软目标、二级用硬上限，正是为了让二级成为终点。
     let mut top_level: Vec<String> = effective
         .iter()
         .filter_map(|root| top_level_storage_child(root, storage_root))
         .collect();
     paths::sort_dedup_paths_case_insensitive(&mut top_level);
     if !top_level.is_empty() && top_level.len() <= super::MAX_SCOPED_FUSE_ROOTS {
+        // 超过软目标意味着该应用会常驻多于 TARGET 个 FUSE 会话（空闲时各自阻塞在
+        // /dev/fuse read 上不耗 CPU，但每个会话都是一个进程的内存开销）。这是
+        // 功耗/内存排查时最需要一眼看到的信号，必须在现场日志里可见。
+        log::warn!(
+            "scoped roots expanded past soft target count={} raw={} list={}",
+            top_level.len(),
+            effective.len(),
+            top_level.join(",")
+        );
         return top_level;
     }
 
@@ -1045,6 +1058,10 @@ fn compact_scoped_mount_roots(mut roots: Vec<String>, storage_root: &str) -> Vec
     //
     // mount namespace 方案会让通配规则退化为按已存在目录匹配，功能上弱于 FUSE，
     // 但作用范围可控，比接管整个存储更安全。
+    //
+    // 硬上限抬到 16（不小于顶层目录个数）之后，本分支只可能在规则跨及 3 个以上用户自建
+    // 顶层目录时才触发，已从"常见配置"收敛为罕见路径；保留它是为了给异常配置一个可控
+    // 回退，而不是放弃 FUSE 覆盖。
     log::warn!(
         "scoped roots exceed limit after top-level fallback: effective={} top_level={} limit={}, \
          skip scoped fuse and use mount namespace",
