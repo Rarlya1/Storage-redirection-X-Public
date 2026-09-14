@@ -995,6 +995,16 @@ fn apply_mount_namespace_fallback(planner: &mut MountPlanner, request: &MountReq
     }
 }
 
+/// 按根启动 scoped FUSE 服务；单根失败只丢弃该根。
+///
+/// 此前任一根启动失败都会调用 [`rollback_scoped_fuse_services`] 卸载所有已成功的会话
+/// 并返回 `None`，一次偶发的单根失败就让整个应用失去 FUSE 覆盖；调用方还会把这次失败
+/// 计入全局能力预算，累计到上限后把所有应用一起打回 mount namespace。改为按根隔离后，
+/// 失败根对应路径回落到 mount namespace 的 bind 分支，其余根继续由 FUSE 覆盖，影响面
+/// 收敛到单条规则。
+///
+/// 只有全部根都失败时才返回 `None`，保持原有的"FUSE 整体不可用"记账语义，
+/// 避免真正不可用的设备仍被反复重试。
 fn start_scoped_fuse_services(
     request: &MountRequest,
     roots: &[String],
@@ -1005,14 +1015,27 @@ fn start_scoped_fuse_services(
     }
 
     let mut states = Vec::with_capacity(roots.len());
+    let mut failed_roots: Vec<&str> = Vec::new();
     for root in roots {
         match start_fuse_service_for_root(request, root, real_root_override.clone()) {
             Some(state) => states.push(state),
-            None => {
-                rollback_scoped_fuse_services(&states);
-                return None;
-            }
+            None => failed_roots.push(root.as_str()),
         }
+    }
+
+    if !failed_roots.is_empty() {
+        log::warn!(
+            "daemon fuse partial scoped mount pkg={} pid={} mounted={} failed={} failed_roots={}",
+            request.package_name,
+            request.pid,
+            states.len(),
+            failed_roots.len(),
+            failed_roots.join(",")
+        );
+    }
+
+    if states.is_empty() {
+        return None;
     }
     Some(states)
 }

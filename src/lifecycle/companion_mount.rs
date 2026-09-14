@@ -718,6 +718,11 @@ pub(super) struct FuseMountState {
     pub child_start_time_ticks: u64,
 }
 
+/// 按根启动 scoped FUSE 服务；单根失败只丢弃该根。
+///
+/// daemon 侧 [`crate::daemon_mount`] 有一份平行实现，两处必须保持一致：它们写入的是
+/// 同一份 FUSE 能力快照，任一侧整组回滚都会把失败计入全局预算，累计到上限后把所有
+/// 应用的 scoped 会话一起打回 mount namespace。
 fn start_scoped_fuse_services(
     request: &CompanionMountRequest,
     roots: &[String],
@@ -728,14 +733,27 @@ fn start_scoped_fuse_services(
     }
 
     let mut states = Vec::with_capacity(roots.len());
+    let mut failed_roots: Vec<&str> = Vec::new();
     for root in roots {
         match start_fuse_service_for_root(request, root, real_root_override.clone()) {
             Some(state) => states.push(state),
-            None => {
-                rollback_scoped_fuse_services(&states);
-                return None;
-            }
+            None => failed_roots.push(root.as_str()),
         }
+    }
+
+    if !failed_roots.is_empty() {
+        log::warn!(
+            "fuse partial scoped mount pkg={} pid={} mounted={} failed={} failed_roots={}",
+            request.package_name,
+            request.pid,
+            states.len(),
+            failed_roots.len(),
+            failed_roots.join(",")
+        );
+    }
+
+    if states.is_empty() {
+        return None;
     }
     Some(states)
 }
