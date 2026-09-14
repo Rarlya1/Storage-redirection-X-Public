@@ -88,6 +88,30 @@ pub fn refresh_runtime_config() {
     }
 }
 
+/// 记录 `libfuse_jni.so` 尚未加载导致的跳过与重试。
+///
+/// 该库由媒体提供者的 FUSE daemon 按需 dlopen，模块加载早于 FUSE daemon 启动时拿不到它属于
+/// 预期情况，重试上限内的每次调用都会走到这里。因此只有首次按 warn 记录，后续重试降到
+/// debug，重试预算耗尽时补一条 info，避免同一进程把成功路径的告警刷成噪声。
+fn log_fuse_library_pending(prefix: &str) {
+    let attempt = RETRY_COUNT.load(Ordering::Relaxed);
+    if attempt == 0 {
+        log::warn!("{prefix}: {} not loaded", LIB_FUSE_JNI);
+    } else if attempt.saturating_add(1) >= MAX_RETRY_COUNT {
+        log::info!(
+            "{prefix}: {} not loaded, retries exhausted count={}",
+            LIB_FUSE_JNI,
+            attempt.saturating_add(1)
+        );
+    } else {
+        log::debug!(
+            "{prefix}: {} not loaded, retry={}",
+            LIB_FUSE_JNI,
+            attempt.saturating_add(1)
+        );
+    }
+}
+
 pub(super) fn sync_runtime_enabled_from_settings() -> bool {
     let enabled = SettingsHub::instance().is_fuse_fix_enabled();
     unsafe {
@@ -187,7 +211,7 @@ fn install_target_if_enabled() {
     }
 
     let Some(elf) = ElfImg::load(LIB_FUSE_JNI) else {
-        log::warn!("fuse fix skip: {} not loaded", LIB_FUSE_JNI);
+        log_fuse_library_pending("fuse fix skip");
         INSTALL_ATTEMPTED.store(false, Ordering::Release);
         RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
         return;
