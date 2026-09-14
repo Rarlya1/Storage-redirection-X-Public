@@ -50,6 +50,22 @@
 - `mapping_mode_only=false`、字段缺失、字段为空或不是 bool：保持旧行为，即 `enabled=true` 时继续执行完整隔离重定向，并在其上叠加 `path_mappings`。
 - 该模式同样覆盖 `com.android.providers.media.module` 等系统代写进程的按调用方重定向逻辑，适合只希望媒体服务代写特定映射目录、不希望整包路径被隔离的场景。
 
+## scoped FUSE 根数与功耗
+
+`storage_backend_mode = auto` 下，native 会把一条应用的规则集合收敛为最少个数的 scoped FUSE 挂载根，每根一个独立 `srx_fuse` 会话进程。两级阈值：
+
+- **软目标 4**（`TARGET_SCOPED_FUSE_ROOTS`）：规则去重、剔除子路径后的根数不超过 4 时直接使用，绝大多数配置收敛在这一档。
+- **硬上限 16**（`MAX_SCOPED_FUSE_ROOTS`）：超过软目标时把各根收敛到顶层存储子目录（上界即顶层目录个数），该结果只要不超过 16 就照常挂载，不放弃 FUSE 覆盖。
+
+功耗与性能特征：
+
+- **空闲成本为零**：每个会话是单线程阻塞在 `/dev/fuse` read 上，无 IO 时不产生 CPU 唤醒；成本只是每个会话一个进程的内存占用。
+- **IO 直通**：会话建立时与内核协商 FUSE passthrough（Android GKI 内核已回移植），协商成功后文件读写直连 backing fd，不回用户态；只有 lookup/元数据走 FUSE 转发。协商结果写入 `fuse init ... passthrough_enabled=` 日志。
+- **随应用退出回收**：应用进程退出后由会话自身卸载挂载点并退出（`fuse redirect app exited, unmount session` 日志），会话数不随应用生命周期累积。
+- **失败只丢单根**：某根启动失败时保留已成功的根（`fuse partial scoped mount` 日志），不再整组回滚，避免健康会话被无谓销毁重建。
+
+排查功耗异常时，先看 `scoped roots expanded past soft target count=` 日志：出现即说明该应用的规则集合覆盖了超过 4 个顶层目录、正在以多于软目标的会话数运行；若会话数与 IO 量都偏大，优先精简该应用的规则（合并到共同父目录），让根数回到软目标以内。
+
 ## 局部沙盒路径
 
 `mapping_mode_only=true` 时，默认只有 `path_mappings` 会被重定向，未命中映射的路径会保持原样。若某些应用或系统服务仍会在 `/storage/emulated/<user>/` 根目录乱创建文件或目录，可以用 `sandboxed_paths` 指定这些路径仍然进入应用沙盒。
