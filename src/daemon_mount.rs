@@ -22,14 +22,39 @@ const PARENT_RECV_GRACE_TIMEOUT_SEC: i64 = 1;
 const FUSE_READY_TIMEOUT_SEC: i64 = 4;
 const DAEMON_MOUNT_SLOW_MS: i64 = 20;
 const MAX_UNMOUNT_PASSES_PER_TARGET: usize = 32;
+/// 同一应用允许同时存在的卡死挂载子进程数上限，超过后熔断该应用的后续挂载请求。
+/// 熔断按包名隔离：单个应用的一次挂载超时不应该让整机其它应用的挂载请求一起失败。
 const MAX_STUCK_MOUNT_CHILDREN: usize = 2;
+/// 卡死子进程计入熔断的时长窗口。
+///
+/// 超过该时长仍未回收的子进程通常处于内核态不可中断等待（D 状态），此时 SIGKILL
+/// 不生效、`waitpid` 也只会持续返回 0，子进程会一直留在回收列表里。如果继续把它
+/// 算作熔断依据，被波及的应用会一直挂载失败直到守护进程重启。因此到期后它不再
+/// 计入阈值，只保留在回收列表中继续尝试回收。
+const STUCK_MOUNT_CHILD_BLOCK_WINDOW_MS: i64 = 120_000;
+/// 卡死子进程总数安全阀。单应用熔断只能限制单个应用的堆积速度，若多个应用同时
+/// 出现无法回收的挂载子进程，仍需要一道全局上限避免整机无限 fork。
+const MAX_TOTAL_STUCK_MOUNT_CHILDREN: usize = 32;
+/// 卡死子进程回收列表的长度上限。D 状态进程可能长期无法回收，需要兜底避免
+/// 列表无界增长；超出时丢弃最早登记的条目，保留较新的卡死记录。
+const MAX_TRACKED_STUCK_MOUNT_CHILDREN: usize = 64;
 const STUCK_MOUNT_SKIP_LOG_STEP: u64 = 32;
 
 static ACTIVE_MOUNT_PIDS: Lazy<Mutex<HashSet<i32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 static LAST_SUCCESS_BY_PID: Lazy<Mutex<HashMap<i32, (u64, u64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static STUCK_MOUNT_CHILDREN: Lazy<Mutex<Vec<i32>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static STUCK_MOUNT_CHILDREN: Lazy<Mutex<Vec<StuckMountChild>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
 static STUCK_MOUNT_SKIP_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// 一个已被判定卡住、仍在等待回收的挂载子进程。
+struct StuckMountChild {
+    pid: i32,
+    /// 登记该子进程时对应请求的包名，用于把熔断限制在同一应用内。
+    package_name: String,
+    /// 登记时刻的单调时钟毫秒值，用于让熔断窗口随时间失效。
+    since_ms: i64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountOperation {
@@ -562,17 +587,24 @@ fn remember_successful_mount(request: &MountRequest) {
     }
 }
 
+/// 判定本次挂载请求是否因为卡死的挂载子进程而熔断。
+///
+/// 判据只统计与本次请求同一包名的卡死子进程，因此单个应用的挂载超时只会让该应用
+/// 的后续请求被跳过，不会连坐整机其它应用的挂载。
 fn should_skip_for_stuck_children(request: &MountRequest) -> bool {
-    let stuck = prune_stuck_mount_children();
-    if stuck <= MAX_STUCK_MOUNT_CHILDREN {
+    prune_stuck_mount_children();
+    let (package_stuck, total_stuck) = stuck_mount_child_counts(&request.package_name);
+    // 主判据按应用隔离；全局阈值只是极端情况下的安全阀。
+    if package_stuck <= MAX_STUCK_MOUNT_CHILDREN && total_stuck <= MAX_TOTAL_STUCK_MOUNT_CHILDREN {
         return false;
     }
 
     let count = STUCK_MOUNT_SKIP_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count <= 8 || count.is_multiple_of(STUCK_MOUNT_SKIP_LOG_STEP) {
         log::warn!(
-            "daemon mount circuit open stuck_children={} pkg={} pid={} op={:?} n={}",
-            stuck,
+            "daemon mount circuit open stuck_children={} total={} pkg={} pid={} op={:?} n={}",
+            package_stuck,
+            total_stuck,
             request.package_name,
             request.pid,
             request.operation,
@@ -582,19 +614,39 @@ fn should_skip_for_stuck_children(request: &MountRequest) -> bool {
     true
 }
 
-/// 清理已经卡住的挂载子进程，返回仍未回收的数量。
+/// 统计仍在熔断窗口内的卡死挂载子进程数量，返回（本次请求所属应用、全部应用）。
+fn stuck_mount_child_counts(package_name: &str) -> (usize, usize) {
+    let children = STUCK_MOUNT_CHILDREN
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let now = monotonic_ms();
+    let mut package_stuck = 0usize;
+    let mut total_stuck = 0usize;
+    for child in children.iter() {
+        if now.saturating_sub(child.since_ms) >= STUCK_MOUNT_CHILD_BLOCK_WINDOW_MS {
+            continue;
+        }
+        total_stuck += 1;
+        if child.package_name == package_name {
+            package_stuck += 1;
+        }
+    }
+    (package_stuck, total_stuck)
+}
+
+/// 清理已经卡住的挂载子进程。
 ///
 /// `waitpid` 与 `kill` 都是可能被信号打断、耗时不确定的系统调用，绝不能在持有全局
 /// 挂载状态锁时执行：挂载请求线程也要拿同一把锁，一旦回收阶段变慢，所有请求都会
 /// 跟着阻塞。因此这里先在锁内取走整份待清理列表，立即释放锁，在锁外完成回收，
 /// 最后再把仍然存活的子进程合并回列表。
-fn prune_stuck_mount_children() -> usize {
+fn prune_stuck_mount_children() {
     let pending = {
         let mut children = STUCK_MOUNT_CHILDREN
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         if children.is_empty() {
-            return 0;
+            return;
         }
         std::mem::take(&mut *children)
     };
@@ -602,12 +654,14 @@ fn prune_stuck_mount_children() -> usize {
     let mut alive = Vec::with_capacity(pending.len());
     for child in pending {
         let mut status = 0;
-        // SAFETY: status 是栈上有效的整数，指针在调用期间保持有效。
-        let ret = unsafe { waitpid(child, &mut status, WNOHANG) };
-        if ret == child {
+        // SAFETY: status 是栈上有效的整数，指针在调用期间保持有效；child.pid 只读自
+        // 回收列表，不涉及借用。
+        let ret = unsafe { waitpid(child.pid, &mut status, WNOHANG) };
+        if ret == child.pid {
             log::warn!(
-                "daemon stuck child finally reaped child={} status={}",
-                child,
+                "daemon stuck child finally reaped child={} pkg={} status={}",
+                child.pid,
+                child.package_name,
                 decode_wait_status(status)
             );
             continue;
@@ -618,16 +672,17 @@ fn prune_stuck_mount_children() -> usize {
                 continue;
             }
             log::warn!(
-                "daemon stuck child waitpid failed child={} errno={} {}",
-                child,
+                "daemon stuck child waitpid failed child={} pkg={} errno={} {}",
+                child.pid,
+                child.package_name,
                 errno,
                 errno_text(errno)
             );
             alive.push(child);
             continue;
         }
-        // SAFETY: kill 只接收整型参数，不涉及借用指针。
-        let _ = unsafe { libc::kill(child, SIGKILL) };
+        // SAFETY: kill 只接收整型参数与信号编号，不涉及借用指针。
+        let _ = unsafe { libc::kill(child.pid, SIGKILL) };
         alive.push(child);
     }
 
@@ -636,24 +691,47 @@ fn prune_stuck_mount_children() -> usize {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     for child in alive {
-        if !children.contains(&child) {
+        if !children.iter().any(|existing| existing.pid == child.pid) {
             children.push(child);
         }
     }
-    children.len()
+    // 内核态不可中断等待的子进程可能永远回收不掉，这里兜底限制列表长度：丢弃最早
+    // 登记的条目，它们已经超出熔断窗口，不再影响熔断判定，只是放弃继续回收。
+    if children.len() > MAX_TRACKED_STUCK_MOUNT_CHILDREN {
+        let excess = children.len() - MAX_TRACKED_STUCK_MOUNT_CHILDREN;
+        children.drain(..excess);
+        log::warn!(
+            "daemon stuck children trimmed dropped={} remaining={}",
+            excess,
+            children.len()
+        );
+    }
 }
 
-fn remember_stuck_mount_child(child: i32) {
+fn remember_stuck_mount_child(child: i32, package_name: &str) {
     let mut children = STUCK_MOUNT_CHILDREN
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    if !children.contains(&child) {
-        children.push(child);
+    let now = monotonic_ms();
+    if !children.iter().any(|existing| existing.pid == child) {
+        children.push(StuckMountChild {
+            pid: child,
+            package_name: package_name.to_string(),
+            since_ms: now,
+        });
     }
+    let package_stuck = children
+        .iter()
+        .filter(|existing| {
+            existing.package_name == package_name
+                && now.saturating_sub(existing.since_ms) < STUCK_MOUNT_CHILD_BLOCK_WINDOW_MS
+        })
+        .count();
     log::warn!(
-        "daemon mount child stuck child={} stuck_children={}",
+        "daemon mount child stuck child={} pkg={} stuck_children={}",
         child,
-        children.len()
+        package_name,
+        package_stuck
     );
 }
 
@@ -715,7 +793,7 @@ fn run_mount_in_forked_child(request: &MountRequest) -> bool {
 
     if child > 0 {
         unsafe { close(sockets[1]) };
-        return handle_parent_process(child, sockets[0], parent_timeout_sec);
+        return handle_parent_process(child, sockets[0], parent_timeout_sec, &request.package_name);
     }
 
     unsafe { close(sockets[0]) };
@@ -1057,7 +1135,12 @@ fn set_mount_namespace(ns_path: Option<&CStr>) -> bool {
     true
 }
 
-fn handle_parent_process(child: i32, sock: c_int, primary_timeout_sec: i64) -> bool {
+fn handle_parent_process(
+    child: i32,
+    sock: c_int,
+    primary_timeout_sec: i64,
+    package_name: &str,
+) -> bool {
     set_recv_timeout(sock, primary_timeout_sec);
     let mut result: i32 = -1;
     let expected = std::mem::size_of::<i32>() as isize;
@@ -1076,7 +1159,7 @@ fn handle_parent_process(child: i32, sock: c_int, primary_timeout_sec: i64) -> b
     }
     unsafe { close(sock) };
     if !reap_child(child, should_reap_nonblocking) {
-        remember_stuck_mount_child(child);
+        remember_stuck_mount_child(child, package_name);
     }
     result == 0
 }
