@@ -1231,6 +1231,11 @@ fn clear_previous_mounts(plan: &MountForkPlan) -> bool {
         }
     }
     if ok && std::fs::remove_file(state_path).is_err() && std::fs::metadata(state_path).is_ok() {
+        log::warn!(
+            "daemon mount state file removal failed path={} errno={}",
+            state_path,
+            last_errno()
+        );
         ok = false;
     }
     ok
@@ -1710,7 +1715,19 @@ fn terminate_recorded_fuse_child(child: &FuseChildIdentity) -> bool {
         return true;
     }
     terminate_fuse_child(child.pid);
-    !crate::platform::is_process_instance_alive(child.pid, start_time_ticks)
+    if crate::platform::is_process_instance_alive(child.pid, start_time_ticks) {
+        // 服务进程卡在不可中断的 FUSE 请求里时 SIGKILL 也无法回收，清理会因此不完整；
+        // 记下残留进程的状态，便于区分真实残留与一次性清理竞态。
+        let summary = read_proc_status_summary(&format!("/proc/{}/status", child.pid))
+            .unwrap_or_else(|| "state=?".to_string());
+        log::warn!(
+            "daemon fuse child not terminated pid={} {}",
+            child.pid,
+            summary
+        );
+        return false;
+    }
+    true
 }
 
 fn terminate_fuse_child(pid: i32) {

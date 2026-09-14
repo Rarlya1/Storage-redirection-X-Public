@@ -671,8 +671,9 @@ fn read_process_status(pid: i32) -> Option<(i32, bool)> {
 fn log_uninterruptible_skip(proc: &AppProcess) {
     let count = UNINTERRUPTIBLE_SKIP_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count <= 8 || count.is_multiple_of(UNINTERRUPTIBLE_SKIP_LOG_STEP) {
+        // 该计数按日志节流统计全部被跳过的进程，不是单个进程被跳过的次数。
         log::warn!(
-            "daemon skip uninterruptible process pid={} pkg={} n={}",
+            "daemon skip uninterruptible process pid={} pkg={} skipped_total={}",
             proc.pid,
             proc.package_name,
             count
