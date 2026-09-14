@@ -1257,7 +1257,11 @@ fn is_covered_by_scoped_fuse_mount(path: &str, scoped_fuse_roots: &[String]) -> 
         .any(|root| paths::eq_ignore_case(path, root) || paths::is_child(path, root))
 }
 
-fn read_mountinfo() -> Option<String> {
+/// 读取当前进程的挂载表。
+///
+/// `mount::core` 在重挂载之前也要用挂载表判断目标是否真的是挂载点，因此这里共享
+/// 同一份读取实现，避免两个模块各写一遍解析逻辑。
+pub(super) fn read_mountinfo() -> Option<String> {
     std::fs::read_to_string("/proc/self/mountinfo").ok()
 }
 
@@ -1279,7 +1283,7 @@ fn mount_source_for_target_from_mountinfo(content: &str, target: &str) -> Option
 }
 
 /// 只判断挂载点是否存在，命中首个匹配即返回，不解析也不分配 root 字段。
-fn mountinfo_has_target(content: &str, target: &str) -> bool {
+pub(super) fn mountinfo_has_target(content: &str, target: &str) -> bool {
     let normalized_target = paths::normalize(target);
     content.lines().any(|line| {
         parse_mountinfo_root_and_target(line)

@@ -1,4 +1,5 @@
 use super::MountPlanner;
+use super::apply::{mountinfo_has_target, read_mountinfo};
 use crate::platform::errno::{last as last_errno, text as errno_text};
 use crate::platform::{fs, module_paths, paths};
 use libc::{
@@ -561,16 +562,28 @@ impl MountPlanner {
     ) -> bool {
         let use_recursive = self.should_use_recursive_bind(source, target, is_recursive);
         if allow_same_inode_shortcut && paths_have_same_inode(source, target) {
-            if self.remount_bind_read_write(target, use_recursive) {
+            // 只有目标本来就是挂载点时，remount 成可写才有意义。目标只是普通目录
+            // （源与目标本身指向同一目录时就是这种情况）时，`MS_BIND | MS_REMOUNT`
+            // 必然返回 EINVAL；先用一次挂载表查询把它筛掉，再走下面的直接绑定。
+            let target_is_mount_point = is_mount_point(target);
+            if target_is_mount_point && self.remount_bind_read_write(target, use_recursive) {
                 self.record_mounted_target(target);
                 log::debug!("bind skip existing src={} dst={}", source, target);
                 return true;
             }
-            log::warn!(
-                "bind existing remount rw failed, retry bind src={} dst={}",
-                source,
-                target
-            );
+            if target_is_mount_point {
+                log::warn!(
+                    "bind existing remount rw failed, retry bind src={} dst={}",
+                    source,
+                    target
+                );
+            } else {
+                log::debug!(
+                    "bind same inode target not mounted, bind directly src={} dst={}",
+                    source,
+                    target
+                );
+            }
         }
 
         let Ok(c_source) = CString::new(source) else {
@@ -1185,6 +1198,16 @@ fn remount_bind_read_write_inner(target: &str, is_recursive: bool) -> bool {
         errno_text(error_no)
     );
     false
+}
+
+/// 判断路径在当前挂载命名空间中是否已经是挂载点。
+///
+/// `mount(MS_BIND | MS_REMOUNT)` 对不是挂载点的路径必然返回 EINVAL，因此在重挂载
+/// 之前先用挂载表判断一次，避免用注定失败的系统调用去试探挂载状态。
+fn is_mount_point(path: &str) -> bool {
+    read_mountinfo()
+        .map(|content| mountinfo_has_target(&content, path))
+        .unwrap_or(false)
 }
 
 fn paths_have_same_inode(left: &str, right: &str) -> bool {
