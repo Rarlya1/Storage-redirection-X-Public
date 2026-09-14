@@ -406,14 +406,9 @@ fn has_dead_fuse_child(state_path: &str, request: &MountRequest) -> bool {
             request.pid,
             request.package_name
         );
-        if crate::fuse_redirect::config::fuse_capability()
-            == crate::fuse_redirect::config::FuseCapability::Available
-        {
-            crate::fuse_redirect::config::record_fuse_capability_result(
-                false,
-                "scoped_session_child_gone",
-            );
-        }
+        // 服务进程消失只说明这一个应用的 scoped 会话结束：应用退出、重启或系统
+        // 清理它的挂载 namespace 都会这样，不代表设备整体不支持 scoped 会话。
+        // 因此这里只记录待重挂，不再改写整机 FUSE 能力快照。
         return true;
     }
     false
