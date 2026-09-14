@@ -32,8 +32,49 @@ const PREWARM_RECONCILE_ROUNDS: usize = 1;
 const PREWARM_MAX_REQUESTS: usize = 16;
 const ANDROID_APP_UID_START: i32 = 10000;
 const UNINTERRUPTIBLE_SKIP_LOG_STEP: u64 = 32;
+/// 周期 reconcile 摘要在计数没有变化时的记录间隔（每轮 3 秒，约 5 分钟）。
+const RECONCILE_SUMMARY_LOG_HEARTBEAT: u64 = 100;
 
 static UNINTERRUPTIBLE_SKIP_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// 周期 reconcile 摘要的记录状态。
+///
+/// 每轮都按 info 记录摘要会让调试日志以秒级速度增长，把真正需要排查的挂载事件
+/// 挤出 tail 窗口。这里只在摘要计数变化时记录，长期不变时按心跳间隔补充一次。
+struct ReconcileSummaryLogState {
+    signature: String,
+    count: u64,
+}
+
+static RECONCILE_SUMMARY_LOG_STATE: Mutex<ReconcileSummaryLogState> =
+    Mutex::new(ReconcileSummaryLogState {
+        signature: String::new(),
+        count: 0,
+    });
+
+fn should_log_reconcile_summary(
+    mode: ReconcileMode,
+    config_version: u64,
+    planned: usize,
+    applied: usize,
+    disabled: usize,
+    skipped: usize,
+    deferred: usize,
+) -> bool {
+    let signature = format!(
+        "{:?}:{:x}:{}:{}:{}:{}:{}",
+        mode, config_version, planned, applied, disabled, skipped, deferred
+    );
+    let mut state = RECONCILE_SUMMARY_LOG_STATE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if state.signature != signature {
+        state.signature = signature;
+        return true;
+    }
+    state.count = state.count.saturating_add(1);
+    state.count.is_multiple_of(RECONCILE_SUMMARY_LOG_HEARTBEAT)
+}
 
 /// daemon 主循环与文件监视线程之间的配置同步状态。
 ///
@@ -454,8 +495,7 @@ fn reconcile_running_apps(config_version: u64, mode: ReconcileMode) -> bool {
         }
     }
 
-    log::info!(
-        "daemon reconcile mode={:?} version={:x} planned={} applied={} disabled={} skipped={} deferred={} ms={}",
+    if should_log_reconcile_summary(
         mode,
         config_version,
         plans.len(),
@@ -463,8 +503,19 @@ fn reconcile_running_apps(config_version: u64, mode: ReconcileMode) -> bool {
         disabled,
         skipped,
         deferred,
-        crate::platform::paths::monotonic_ms().saturating_sub(started_ms)
-    );
+    ) {
+        log::info!(
+            "daemon reconcile mode={:?} version={:x} planned={} applied={} disabled={} skipped={} deferred={} ms={}",
+            mode,
+            config_version,
+            plans.len(),
+            applied,
+            disabled,
+            skipped,
+            deferred,
+            crate::platform::paths::monotonic_ms().saturating_sub(started_ms)
+        );
+    }
     applied > 0 || disabled > 0
 }
 

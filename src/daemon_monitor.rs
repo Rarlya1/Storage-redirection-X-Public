@@ -41,6 +41,8 @@ const OVERFLOW_RESYNC_MIN_INTERVAL_MS: i64 = 30_000;
 const MAX_PUBLIC_OWNER_REPAIR_DIRS: usize = 32768;
 /// 公共 owner 修复不安装 inotify watch，使用有界周期扫描覆盖运行期间新建的目录。
 const PUBLIC_OWNER_REPAIR_INTERVAL_MS: i64 = 1000;
+/// 公共 owner 修复扫描在目录数没有变化时的记录间隔（扫描每 1 秒一轮，约 5 分钟）。
+const PUBLIC_OWNER_REPAIR_LOG_HEARTBEAT: u64 = 300;
 /// 递归展开监视树时最多访问的目录数，与 [`MAX_PUBLIC_OWNER_REPAIR_DIRS`] 对齐。
 const MAX_EXISTING_TREE_REPAIR_DIRS: usize = 32768;
 const PUBLIC_OWNER_EXISTING_WATCH_DEPTH: usize = 2;
@@ -103,6 +105,10 @@ pub struct RegularAppMonitor {
     /// 配置未变化而直接沿用现有监视树的次数，用于限频输出排查日志。
     unchanged_reconfigure_count: u32,
     last_public_owner_repair_ms: i64,
+    /// 各公共 owner 根上次扫描到的目录数，用于只在覆盖范围变化时记录扫描摘要。
+    public_owner_repair_log_dirs: HashMap<String, usize>,
+    /// 公共 owner 修复扫描的记录次数，用于按心跳间隔补充摘要。
+    public_owner_repair_log_count: u64,
 }
 
 impl RegularAppMonitor {
@@ -125,6 +131,8 @@ impl RegularAppMonitor {
             last_overflow_resync_ms: 0,
             unchanged_reconfigure_count: 0,
             last_public_owner_repair_ms: 0,
+            public_owner_repair_log_dirs: HashMap::new(),
+            public_owner_repair_log_count: 0,
         }
     }
 
@@ -407,6 +415,8 @@ impl RegularAppMonitor {
         self.missing_roots = 0;
         self.capacity_limited = false;
         self.last_public_owner_repair_ms = 0;
+        self.public_owner_repair_log_dirs.clear();
+        self.public_owner_repair_log_count = 0;
     }
 
     fn add_watch_tree(&mut self, root: &WatchRoot) -> bool {
@@ -417,7 +427,7 @@ impl RegularAppMonitor {
         true
     }
 
-    fn repair_public_owner_root(&self, root: &WatchRoot) -> bool {
+    fn repair_public_owner_root(&mut self, root: &WatchRoot) -> bool {
         let Some(start) = select_watch_start(root) else {
             return false;
         };
@@ -572,7 +582,7 @@ impl RegularAppMonitor {
         }
     }
 
-    fn repair_existing_public_tree(&self, root: &WatchNode) {
+    fn repair_existing_public_tree(&mut self, root: &WatchNode) {
         let mut stack = vec![root.clone()];
         let mut repaired = 0usize;
         while let Some(node) = stack.pop() {
@@ -620,11 +630,23 @@ impl RegularAppMonitor {
                 stack.push(child);
             }
         }
-        log::info!(
-            "daemon public owner repair scan root={} dirs={}",
-            root.backend_dir,
-            repaired
-        );
+        // 扫描每 1 秒一轮，但覆盖范围通常长期不变：只在目录数变化时记录摘要，
+        // 长期不变时按心跳补充，避免摘要把挂载与监视日志挤出 tail 窗口。
+        let previous_dirs = self
+            .public_owner_repair_log_dirs
+            .insert(root.backend_dir.clone(), repaired);
+        self.public_owner_repair_log_count = self.public_owner_repair_log_count.saturating_add(1);
+        if previous_dirs != Some(repaired)
+            || self
+                .public_owner_repair_log_count
+                .is_multiple_of(PUBLIC_OWNER_REPAIR_LOG_HEARTBEAT)
+        {
+            log::info!(
+                "daemon public owner repair scan root={} dirs={}",
+                root.backend_dir,
+                repaired
+            );
+        }
     }
 
     fn add_watch_node(&mut self, node: &WatchNode) -> bool {
