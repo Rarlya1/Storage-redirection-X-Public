@@ -1,11 +1,19 @@
 use super::MountPlanner;
 use crate::domain::{PathMapping, sort_path_mappings_shortest_request_first};
+use crate::platform::errno::last as last_errno;
 use crate::platform::{fs, module_paths, paths};
 
 pub(super) struct PathMappingApplyOptions {
     pub(super) should_chown_current_dirs: bool,
     pub(super) should_create_missing_request_path: bool,
     pub(super) should_use_existing_target_source_only: bool,
+}
+
+// 挂载点只要求请求路径存在目录或文件节点，具体类型由映射目标决定。
+fn mapping_mount_point_exists(path: &str) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_dir() || metadata.is_file())
+        .unwrap_or(false)
 }
 
 impl MountPlanner {
@@ -287,15 +295,10 @@ impl MountPlanner {
         should_prefer_redirect_fallback: bool,
     ) -> bool {
         if !should_prefer_redirect_fallback {
-            return std::fs::metadata(request_path)
-                .map(|metadata| metadata.is_dir() || metadata.is_file())
-                .unwrap_or(false);
+            return mapping_mount_point_exists(request_path);
         }
 
-        if std::fs::metadata(request_path)
-            .map(|metadata| metadata.is_dir() || metadata.is_file())
-            .unwrap_or(false)
-        {
+        if mapping_mount_point_exists(request_path) {
             return true;
         }
 
@@ -321,6 +324,21 @@ impl MountPlanner {
         if fs::create_directory(request_path, uid) {
             return true;
         }
+        let direct_errno = last_errno();
+
+        // 代理应用写入时，这次公共路径 mkdir 会被本模块的写入重定向接管，落到重定向
+        // 目标目录，请求路径本身仍然缺失。此时改用真实存储后端创建挂载点再复查；
+        // 否则随后的 bind 一定以 ENOENT 失败，映射会一直无法生效。
+        if self.ensure_real_public_directory_exists(request_path)
+            && mapping_mount_point_exists(request_path)
+        {
+            log::debug!(
+                "map mount point prepared via real backend request={} direct_errno={}",
+                request_path,
+                direct_errno
+            );
+            return true;
+        }
 
         let Some(current_relative) = paths::relative_child_path(request_path, storage_path) else {
             return false;
@@ -335,12 +353,24 @@ impl MountPlanner {
         };
         let current_fallback = self.normalize_path(&current_fallback);
         if self.ensure_directory_exists(&current_fallback, should_chown_current_dirs) {
+            // 重定向后端目录就绪不代表挂载点可用：请求路径仍然缺失时继续绑定只会
+            // 得到 ENOENT，这里按未准备处理，让调用方跳过这次映射。
+            if mapping_mount_point_exists(request_path) {
+                log::debug!(
+                    "map mount point prepared via backend fallback request={} backend={} direct_errno={}",
+                    request_path,
+                    current_fallback,
+                    direct_errno
+                );
+                return true;
+            }
             log::warn!(
-                "map mount point prepared via backend fallback request={} backend={}",
+                "map mount point missing after backend fallback request={} backend={} direct_errno={}",
                 request_path,
-                current_fallback
+                current_fallback,
+                direct_errno
             );
-            return true;
+            return false;
         }
 
         false
