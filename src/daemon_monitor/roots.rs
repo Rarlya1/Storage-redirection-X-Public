@@ -18,7 +18,11 @@ pub(super) fn build_watch_roots(spec: &MonitorAppSpec) -> Vec<WatchRoot> {
 }
 
 pub(super) fn build_private_owner_repair_roots(spec: &MonitorAppSpec) -> Vec<WatchRoot> {
-    if !spec.is_enabled {
+    // 只开了路径映射的应用在挂载阶段不触碰私有目录属主与权限：`apply_path_mappings_only`
+    // 不执行 `restore_own_private_directories`，只做绑定挂载。守护进程侧必须保持一致，
+    // 否则映射模式的应用仍会因为监视根建立和后续事件触发被改写
+    // `Android/{data,media,obb}/<pkg>` 的属主与权限位，导致外观上「只开了映射却被改了权限」。
+    if !spec.is_enabled || spec.is_mapping_mode_only {
         return Vec::new();
     }
 
