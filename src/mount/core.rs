@@ -142,15 +142,43 @@ impl MountPlanner {
         };
 
         // 真实公共目录必须保持 media_rw 所有权；应用可写性由目录模式提供。
-        if owner_uid >= 0 {
-            let effective_uid = if is_shared_public_storage_directory(&metadata_path, self.user_id)
-            {
-                MEDIA_RW_UID
-            } else {
-                owner_uid as u32
-            };
-            // SAFETY: c_path 在调用期间是有效且以 NUL 结尾的 CString。
-            let ret = unsafe { chown(c_path.as_ptr(), effective_uid, MEDIA_RW_GID) };
+        let effective_uid = if owner_uid < 0 {
+            None
+        } else if is_shared_public_storage_directory(&metadata_path, self.user_id) {
+            Some(MEDIA_RW_UID)
+        } else {
+            Some(owner_uid as u32)
+        };
+
+        // 已存在且属主已经就位的目录保持原样，一个元数据系统调用都不发。
+        //
+        // 真实共享存储里的既有目录（尤其 Android/data|media|obb/<pkg>）由 MediaProvider
+        // 按它自己的模式创建和维护，硬覆盖成 MAPPED_DIR_MODE 会换掉既有权限位，反而让
+        // 原本能正常访问自有私有目录的应用变成不可写。该函数有多个调用点都指向应用
+        // 自己的目标目录，属主已是目标 uid 时目录对应用必然可用，无需再干预；只有目录
+        // 是本次新创建、或属主确实与应用不一致时才做完整修正。
+        if is_existing && let Some(uid) = effective_uid {
+            let mut st = std::mem::MaybeUninit::<c_stat>::uninit();
+            // SAFETY: c_path 由 CString 保证以 NUL 结尾；st 是栈上有效存储，stat 只写入该结构。
+            if unsafe { c_stat(c_path.as_ptr(), st.as_mut_ptr()) } == 0 {
+                // SAFETY: 上一步返回 0 表示 st 已被完整初始化。
+                let st = unsafe { st.assume_init() };
+                if st.st_uid == uid {
+                    log::debug!(
+                        "mount dir: keep existing metadata path={} metadata_path={} uid={} mode={:o}",
+                        path,
+                        metadata_path,
+                        uid,
+                        st.st_mode & 0o7777
+                    );
+                    return true;
+                }
+            }
+        }
+
+        if let Some(uid) = effective_uid {
+            // SAFETY: chown 只依赖 c_path 指向的有效 NUL 结尾字符串，无借用指针参数。
+            let ret = unsafe { chown(c_path.as_ptr(), uid, MEDIA_RW_GID) };
             if ret != 0 {
                 let error_no = last_errno();
                 log::warn!(
@@ -163,7 +191,7 @@ impl MountPlanner {
             }
         }
 
-        // 无论目录是否已存在，都确保权限正确
+        // 仅在目录新创建或属主刚被修正时才覆盖映射目录模式。
         let ret = unsafe { chmod(c_path.as_ptr(), MAPPED_DIR_MODE) };
         if ret != 0 {
             let error_no = last_errno();
