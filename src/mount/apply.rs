@@ -1,7 +1,7 @@
 use super::map::PathMappingApplyOptions;
 use super::{MountPlanner, concrete_mount_fallback_parent};
 use crate::domain::PathMapping;
-use crate::platform::{fs, module_paths, paths};
+use crate::platform::{fs, module_paths, mountinfo, paths};
 use libc::{MNT_DETACH, umount2};
 use std::ffi::CString;
 
@@ -1269,15 +1269,18 @@ fn mount_source_for_target_from_mountinfo(content: &str, target: &str) -> Option
     let normalized_target = paths::normalize(target);
     let mut matched_root: Option<String> = None;
     for line in content.lines() {
-        let Some((root_field, mount_target)) = parse_mountinfo_root_and_target(line) else {
+        let Some(entry) = mountinfo::parse_entry(line) else {
             continue;
         };
-        if !paths::eq_ignore_case(&mount_target, &normalized_target) {
+        if !paths::eq_ignore_case(
+            &paths::normalize(&mountinfo::unescape_field(entry.target)),
+            &normalized_target,
+        ) {
             continue;
         }
         // 命中项的 target 长度一致，沿用原先 max_by_key 的“取最后一个命中”语义；
         // 只有命中时才展开 root 字段，未命中的行不再产生分配。
-        matched_root = Some(unescape_mountinfo_field(root_field));
+        matched_root = Some(mountinfo::unescape_field(entry.root));
     }
     matched_root
 }
@@ -1286,26 +1289,15 @@ fn mount_source_for_target_from_mountinfo(content: &str, target: &str) -> Option
 pub(super) fn mountinfo_has_target(content: &str, target: &str) -> bool {
     let normalized_target = paths::normalize(target);
     content.lines().any(|line| {
-        parse_mountinfo_root_and_target(line)
-            .map(|(_, mount_target)| paths::eq_ignore_case(&mount_target, &normalized_target))
+        mountinfo::parse_entry(line)
+            .map(|entry| {
+                paths::eq_ignore_case(
+                    &paths::normalize(&mountinfo::unescape_field(entry.target)),
+                    &normalized_target,
+                )
+            })
             .unwrap_or(false)
     })
-}
-
-fn parse_mountinfo_root_and_target(line: &str) -> Option<(&str, String)> {
-    let separator = line.find(" - ")?;
-    let before_separator = &line[..separator];
-    let after_separator = &line[separator + 3..];
-    let mut before_fields = before_separator.split_whitespace();
-    let _id = before_fields.next()?;
-    let _parent = before_fields.next()?;
-    let _major_minor = before_fields.next()?;
-    let root_field = before_fields.next()?;
-    let target = paths::normalize(&unescape_mountinfo_field(before_fields.next()?));
-    let mut after_fields = after_separator.split_whitespace();
-    let _fs_type = after_fields.next()?;
-    let _source = after_fields.next()?;
-    Some((root_field, target))
 }
 
 fn mountinfo_root_matches_data_backend(root: &str, backend: &str) -> bool {
@@ -1337,28 +1329,4 @@ fn detach_mount_if_present(target: &str) {
             unsafe { *libc::__errno() }
         );
     }
-}
-
-fn unescape_mountinfo_field(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] == b'\\'
-            && index + 3 < bytes.len()
-            && bytes[index + 1..index + 4]
-                .iter()
-                .all(|byte| (b'0'..=b'7').contains(byte))
-        {
-            let code = (bytes[index + 1] - b'0') * 64
-                + (bytes[index + 2] - b'0') * 8
-                + (bytes[index + 3] - b'0');
-            output.push(code as char);
-            index += 4;
-        } else {
-            output.push(bytes[index] as char);
-            index += 1;
-        }
-    }
-    output
 }

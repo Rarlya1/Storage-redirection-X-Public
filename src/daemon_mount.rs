@@ -5,7 +5,7 @@ use crate::mount_status_marker::write_mount_status_marker;
 use crate::platform::errno::{last as last_errno, text as errno_text};
 use crate::platform::paths::monotonic_ms;
 use crate::platform::unique_fd::UniqueFd;
-use crate::platform::{fs, module_paths, paths};
+use crate::platform::{fs, module_paths, mountinfo, paths};
 use libc::{
     AF_UNIX, CLONE_NEWNS, MNT_DETACH, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_RDONLY, O_TRUNC, O_WRONLY,
     SIGKILL, SIGTERM, SO_RCVTIMEO, SOCK_DGRAM, SOL_SOCKET, WNOHANG, c_int, c_void, close, open,
@@ -1638,45 +1638,15 @@ fn mount_target_count_from_mountinfo(
     let canonical_target = canonical_mount_target(target, storage_root, alias_roots);
     content
         .lines()
-        .filter(|line| {
-            let Some(raw_target) = parse_mountinfo_raw_target(line) else {
-                return false;
-            };
-            let mount_target = unescape_mountinfo_field(raw_target);
-            canonical_mount_target(&mount_target, storage_root, alias_roots) == canonical_target
+        .filter_map(mountinfo::parse_entry)
+        .filter(|entry| {
+            canonical_mount_target(
+                &mountinfo::unescape_field(entry.target),
+                storage_root,
+                alias_roots,
+            ) == canonical_target
         })
         .count()
-}
-
-fn parse_mountinfo_raw_target(line: &str) -> Option<&str> {
-    let separator = line.find(" - ")?;
-    let before_separator = &line[..separator];
-    let mut fields = before_separator.split_whitespace();
-    let _id = fields.next()?;
-    let _parent = fields.next()?;
-    let _major_minor = fields.next()?;
-    let _root = fields.next()?;
-    fields.next()
-}
-
-fn unescape_mountinfo_field(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(value.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' && index + 3 < bytes.len() {
-            let digits = &bytes[index + 1..index + 4];
-            if digits.iter().all(|ch| (b'0'..=b'7').contains(ch)) {
-                let code = (digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0');
-                out.push(code);
-                index += 4;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Clone, Copy)]

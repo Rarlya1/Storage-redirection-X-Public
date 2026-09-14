@@ -1,7 +1,7 @@
 use crate::config::StorageBackendMode;
 use crate::domain::PathMapping;
 use crate::platform::errno::last as last_errno;
-use crate::platform::{fs, module_paths, paths};
+use crate::platform::{fs, module_paths, mountinfo, paths};
 use fuser::{MountOption, SessionACL};
 use std::ffi::CString;
 use std::io;
@@ -321,6 +321,9 @@ pub fn mount_blocking_with_ready(
     let package_name = config.package_name.clone();
     let user_id = config.user_id();
     let mount_point = fuse_mount_point(&config, user_id);
+    // 挂载源必须唯一：daemon 的重新挂载会在同一路径叠加新会话的挂载，收尾时只能靠它
+    // 确认挂载点是否仍属于本次会话。
+    let session_mount_source = scoped_mount_source(std::process::id());
     let metadata_dir = mount_point_metadata_dir(&mount_point, user_id);
     if !fs::create_directory(&metadata_dir, config.uid) {
         log::error!(
@@ -341,7 +344,7 @@ pub fn mount_blocking_with_ready(
     };
     let mut mount_options = fuser::Config::default();
     mount_options.mount_options = vec![
-        MountOption::FSName("srx_fuse_redirect".to_string()),
+        MountOption::FSName(session_mount_source.clone()),
         MountOption::Subtype("srx".to_string()),
         MountOption::RW,
         MountOption::NoSuid,
@@ -381,6 +384,22 @@ pub fn mount_blocking_with_ready(
             return false;
         }
     };
+    // 挂载后立即登记本次会话的挂载身份；挂载表不可读时返回 None，收尾退回按挂载源前缀判断。
+    let session_mount_identity = ScopedMountIdentity::capture(&mount_point, &session_mount_source);
+    if let Some(identity) = session_mount_identity.as_ref() {
+        log::info!(
+            "fuse redirect session mount registered mp={} mount_id={} source={}",
+            mount_point,
+            identity.mount_id,
+            identity.source
+        );
+    } else {
+        log::warn!(
+            "fuse redirect session mount identity unavailable mp={} source={}",
+            mount_point,
+            session_mount_source
+        );
+    }
     send_ready_result(ready_sock, 0);
 
     loop {
@@ -390,7 +409,12 @@ pub fn mount_blocking_with_ready(
             // 应用退出、重启记成 scoped 会话失败，进而把整机 FUSE 能力锁成不可用。
             let app_alive =
                 crate::platform::is_process_instance_alive(app_pid, app_start_time_ticks);
-            return finish_background_session(background, &mount_point, !app_alive);
+            return finish_background_session(
+                background,
+                &mount_point,
+                !app_alive,
+                session_mount_identity.as_ref(),
+            );
         }
         if !crate::platform::is_process_instance_alive(app_pid, app_start_time_ticks) {
             log::info!(
@@ -399,7 +423,12 @@ pub fn mount_blocking_with_ready(
                 app_pid,
                 mount_point
             );
-            return finish_background_session(background, &mount_point, true);
+            return finish_background_session(
+                background,
+                &mount_point,
+                true,
+                session_mount_identity.as_ref(),
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -409,7 +438,26 @@ fn finish_background_session(
     background: fuser::BackgroundSession,
     mount_point: &str,
     app_exited: bool,
+    identity: Option<&ScopedMountIdentity>,
 ) -> bool {
+    // 收尾前必须确认挂载点仍由本次会话持有：daemon 的重新挂载会在同一路径叠加新会话的
+    // 挂载，此时按路径卸载摘掉的是新会话的挂载，应用会直接看到 ENOTCONN。fuser 的
+    // `umount_and_join` 与 `BackgroundSession` 的 Drop 都会按路径卸载，因此这种情况下只能
+    // 跳过收尾，让服务进程直接退出（进程退出会关闭 `/dev/fuse`，内核随之结束本次会话）。
+    let ownership = mount_ownership(mount_point, identity);
+    if !matches!(ownership, MountOwnership::Session) {
+        log::info!(
+            "fuse redirect session mount not owned mp={} app_exited={} state={} session_mount_id={}",
+            mount_point,
+            app_exited,
+            ownership.as_str(),
+            identity
+                .map(|identity| identity.mount_id)
+                .unwrap_or_default()
+        );
+        std::mem::forget(background);
+        return true;
+    }
     match background.umount_and_join() {
         Ok(()) => {
             log::info!(
@@ -419,7 +467,7 @@ fn finish_background_session(
             );
             true
         }
-        Err(error) => finish_failed_session(mount_point, app_exited, &error),
+        Err(error) => finish_failed_session(mount_point, app_exited, &error, identity),
     }
 }
 
@@ -429,9 +477,14 @@ fn finish_background_session(
 /// 进程，应用退出时系统也会连带销毁它的挂载 namespace。此时 EINVAL/ENOENT/ENOTCONN
 /// 只说明挂载点已经不存在，应用仍在运行且挂载点仍有引用时则是 EBUSY，两者都只是收尾
 /// 事件，不能证明设备不支持 scoped 会话。能力快照是整机状态，一旦写成 unavailable，
-/// Auto 后端在本轮开机内不会再次尝试 scoped 挂载，因此只有挂载点仍在当前 namespace 且
+/// Auto 后端在本轮开机内不会再次尝试 scoped 挂载，因此只有挂载点仍由本次会话持有且
 /// 延迟卸载也失败时才记录能力失败。
-fn finish_failed_session(mount_point: &str, app_exited: bool, error: &io::Error) -> bool {
+fn finish_failed_session(
+    mount_point: &str,
+    app_exited: bool,
+    error: &io::Error,
+    identity: Option<&ScopedMountIdentity>,
+) -> bool {
     let error_no = error.raw_os_error().unwrap_or_default();
     if app_exited || is_already_unmounted_errno(error_no) {
         log::info!(
@@ -443,7 +496,7 @@ fn finish_failed_session(mount_point: &str, app_exited: bool, error: &io::Error)
         return true;
     }
 
-    if detach_mount_point(mount_point) {
+    if detach_mount_point(mount_point, identity) {
         log::warn!(
             "fuse redirect session detach ok mp={} app_exited={} err={}",
             mount_point,
@@ -453,7 +506,7 @@ fn finish_failed_session(mount_point: &str, app_exited: bool, error: &io::Error)
         return true;
     }
 
-    // 挂载点仍在本命名空间且延迟卸载也没能摘除，说明这次 scoped 会话确实无法收尾；
+    // 挂载点仍由本次会话持有且延迟卸载也没能摘除，说明这次 scoped 会话确实无法收尾；
     // 记录能力失败，让 Auto 后端后续请求稳定回退到 namespace。
     record_fuse_capability_result(false, "scoped_session_end_error");
     log::warn!(
@@ -479,10 +532,13 @@ fn is_already_unmounted_errno(error_no: i32) -> bool {
 ///
 /// 返回 true 表示挂载点已经不在当前命名空间：本次卸载成功，或系统（应用退出、挂载
 /// namespace 销毁）已经把它摘掉。
-fn detach_mount_point(mount_point: &str) -> bool {
-    // 只有挂载点上确实是本模块的 scoped FUSE 挂载才做延迟卸载；否则宁可保留告警，
+fn detach_mount_point(mount_point: &str, identity: Option<&ScopedMountIdentity>) -> bool {
+    // 只有挂载点最顶层确实是本次会话的 scoped 挂载才做延迟卸载；否则宁可保留告警，
     // 也不能在收尾失败时误摘同路径上新挂载的其它文件系统。
-    if !is_scoped_fuse_mount_point(mount_point) {
+    if !matches!(
+        mount_ownership(mount_point, identity),
+        MountOwnership::Session
+    ) {
         return false;
     }
 
@@ -496,30 +552,130 @@ fn detach_mount_point(mount_point: &str) -> bool {
     is_already_unmounted_errno(last_errno())
 }
 
-/// 判断挂载点当前承载的挂载是否本模块的 scoped FUSE 挂载。
+/// scoped 挂载使用的挂载源前缀。
 ///
-/// 本模块的 scoped 挂载以 `fuse.srx` 为文件系统类型，通过挂载表即可与本机其它
-/// FUSE 挂载（例如系统媒体 FUSE）区分开。
-fn is_scoped_fuse_mount_point(mount_point: &str) -> bool {
+/// 测试流按该前缀在 `/proc/<pid>/mountinfo` 中识别本模块的 scoped 挂载，格式不能改动；
+/// 会话标识以 `[pid]` 追加在后缀里，用于区分同一路径上被新会话替换的挂载。
+const SCOPED_MOUNT_SOURCE_PREFIX: &str = "srx_fuse_redirect";
+
+/// 生成本次 scoped 会话唯一的挂载源（`MountOption::FSName`）。
+///
+/// 挂载源会作为 `mount(2)` 的 source 出现在 `/proc/self/mountinfo` 里，不参与内核的 FUSE
+/// 参数解析，因此可以安全地携带会话标识。
+fn scoped_mount_source(service_pid: u32) -> String {
+    format!("{SCOPED_MOUNT_SOURCE_PREFIX}[{service_pid}]")
+}
+
+/// `/proc/self/mountinfo` 中一条挂载记录里用于判定挂载归属的字段。
+struct MountEntry {
+    mount_id: u64,
+    fs_type: String,
+    source: String,
+}
+
+impl MountEntry {
+    /// 判断这条记录是否本模块的 scoped FUSE 挂载。
+    ///
+    /// scoped 挂载在内核 `mount(2)` 直挂时文件系统类型是 `fuse`，经 fusermount 回退时由
+    /// `subtype=srx` 记为 `fuse.srx`；两者都要再看挂载源前缀，避免把系统媒体 FUSE 挂载
+    /// （挂载源是 `/dev/fuse`）当成模块挂载。
+    fn is_scoped_fuse(&self) -> bool {
+        matches!(self.fs_type.as_str(), "fuse" | "fuse.srx")
+            && self.source.starts_with(SCOPED_MOUNT_SOURCE_PREFIX)
+    }
+}
+
+/// scoped 会话在挂载后登记的挂载身份。
+///
+/// 收尾时必须确认挂载点仍由本次会话持有，因此保存本次会话唯一的挂载源；`mount_id` 只用于
+/// 诊断日志。
+struct ScopedMountIdentity {
+    source: String,
+    mount_id: u64,
+}
+
+impl ScopedMountIdentity {
+    /// 挂载完成后登记本次会话身份；挂载表不可读或最顶层挂载不是本次会话时返回 None。
+    fn capture(mount_point: &str, source: &str) -> Option<Self> {
+        let entry = topmost_mount_entry(mount_point)?;
+        (entry.source == source).then(|| Self {
+            source: source.to_string(),
+            mount_id: entry.mount_id,
+        })
+    }
+}
+
+/// 读取当前挂载表中指定挂载点上的全部记录。
+///
+/// 同一路径可能叠着多层挂载（daemon 重挂载期间旧会话与新会话并存），因此返回列表，由
+/// [`topmost_mount_entry`] 按挂载 ID 选出最顶层的一条。
+fn mount_entries_at(mount_point: &str) -> Vec<MountEntry> {
     let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return false;
+        return Vec::new();
     };
     let normalized = paths::normalize(mount_point);
-    content.lines().any(|line| {
-        let Some(separator) = line.find(" - ") else {
-            return false;
-        };
-        let mut fields = line[..separator].split_whitespace();
-        let target = fields.nth(4);
-        if !target.is_some_and(|value| paths::eq_ignore_case(&paths::normalize(value), &normalized))
-        {
-            return false;
+    content
+        .lines()
+        .filter_map(|line| {
+            let entry = mountinfo::parse_entry(line)?;
+            if !paths::eq_ignore_case(
+                &paths::normalize(&mountinfo::unescape_field(entry.target)),
+                &normalized,
+            ) {
+                return None;
+            }
+            Some(MountEntry {
+                mount_id: entry.mount_id,
+                fs_type: entry.fs_type.to_string(),
+                source: mountinfo::unescape_field(entry.source),
+            })
+        })
+        .collect()
+}
+
+/// 返回挂载点上最顶层的挂载记录（挂载 ID 最大的一条）。
+fn topmost_mount_entry(mount_point: &str) -> Option<MountEntry> {
+    mount_entries_at(mount_point)
+        .into_iter()
+        .max_by_key(|entry| entry.mount_id)
+}
+
+/// 判断挂载点当前由谁持有。
+fn mount_ownership(mount_point: &str, identity: Option<&ScopedMountIdentity>) -> MountOwnership {
+    let Some(entry) = topmost_mount_entry(mount_point) else {
+        return MountOwnership::Released;
+    };
+    let owned_by_session = match identity {
+        Some(identity) => entry.source == identity.source,
+        // 未能登记会话身份（挂载时挂载表不可读）时退回按 scoped 挂载特征判断，至少不会把
+        // 系统媒体 FUSE 挂载当成模块挂载。
+        None => entry.is_scoped_fuse(),
+    };
+    if owned_by_session {
+        MountOwnership::Session
+    } else {
+        MountOwnership::Superseded
+    }
+}
+
+/// scoped 会话收尾前判断挂载点归属的结果。
+enum MountOwnership {
+    /// 挂载点最顶层仍是本次会话的挂载。
+    Session,
+    /// 挂载点上已没有记录：本次会话的挂载已经被摘除。
+    Released,
+    /// 挂载点被其它挂载接管（daemon 重新挂载叠加了新会话的挂载）。
+    Superseded,
+}
+
+impl MountOwnership {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MountOwnership::Session => "session",
+            MountOwnership::Released => "released",
+            MountOwnership::Superseded => "superseded",
         }
-        line[separator + 3..]
-            .split_whitespace()
-            .next()
-            .is_some_and(|fs_type| fs_type == "fuse.srx")
-    })
+    }
 }
 
 pub(super) fn fuse_mount_point(config: &FuseRedirectConfig, user_id: i32) -> String {

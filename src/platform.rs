@@ -16,6 +16,8 @@ pub mod linker;
 pub mod lru_cache;
 #[path = "platform/module_paths.rs"]
 pub mod module_paths;
+#[path = "platform/mountinfo.rs"]
+pub mod mountinfo;
 #[path = "platform/paths.rs"]
 pub mod paths;
 #[path = "platform/unique_fd.rs"]
