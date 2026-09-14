@@ -873,7 +873,14 @@ fn terminate_fuse_service(pid: i32) {
     for _ in 0..30 {
         let mut status: c_int = 0;
         let wait_ret = unsafe { waitpid(pid, &mut status as *mut _, WNOHANG) };
-        if wait_ret == pid || wait_ret < 0 {
+        if wait_ret == pid {
+            return;
+        }
+        // `waitpid` 返回负值只说明当前进程无法回收该目标，不表示目标已经退出
+        // （FUSE 服务子进程由挂载 worker fork，worker 退出后由 init 收养，此后
+        // 固定得到 ECHILD）。把它当作已退出会直接跳过下面的 SIGKILL 升级，留下
+        // 长期存活并空转的残留服务进程；这里改用 `/proc` 存活探测。
+        if !crate::platform::process_exists(pid) {
             return;
         }
         unsafe { libc::usleep(10 * 1000) };
@@ -884,7 +891,12 @@ fn terminate_fuse_service(pid: i32) {
         let mut status: c_int = 0;
         // SAFETY: status 是栈上有效的 c_int，指针在调用期间保持有效。
         let wait_ret = unsafe { waitpid(pid, &mut status as *mut _, WNOHANG) };
-        if wait_ret == pid || wait_ret < 0 {
+        if wait_ret == pid {
+            return;
+        }
+        // SIGKILL 之后同样不能依赖 `waitpid` 判断目标是否消失，否则会对已经退出
+        // 但无法回收的目标误报残留。
+        if !crate::platform::process_exists(pid) {
             return;
         }
         // SAFETY: usleep 只接收整型参数，不涉及借用指针。

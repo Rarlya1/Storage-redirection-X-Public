@@ -1799,7 +1799,15 @@ fn terminate_fuse_child(pid: i32) {
     for _ in 0..30 {
         let mut status = 0;
         let ret = unsafe { waitpid(pid, &mut status, WNOHANG) };
-        if ret == pid || ret < 0 {
+        if ret == pid {
+            return;
+        }
+        // `waitpid` 只能回收本进程的子进程：FUSE 服务子进程由挂载 worker fork，
+        // worker 退出后会被 init 收养，此后 `waitpid` 固定返回负值（ECHILD）。
+        // 把负返回值也当作「已回收」会在第一次循环就直接返回，永远走不到下面的
+        // SIGKILL 升级，留下长期存活并空转的残留服务进程。因此这里以 `/proc`
+        // 存活探测为准，用满整个 SIGTERM 宽限窗口后再升级信号。
+        if !crate::platform::process_exists(pid) {
             return;
         }
         unsafe { libc::usleep(10 * 1000) };

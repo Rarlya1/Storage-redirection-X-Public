@@ -116,6 +116,15 @@ pub fn is_process_instance_alive(pid: i32, start_time_ticks: u64) -> bool {
     process_start_time_ticks(pid) == Some(start_time_ticks)
 }
 
+/// 判断 PID 当前是否仍存在于进程表中。
+///
+/// 与 [`is_process_instance_alive`] 的区别是不校验启动时间，用于回收「不属于当前
+/// 进程」的目标：这类目标无法通过 `waitpid` 观测退出（只会得到 `ECHILD`），必须
+/// 依赖 `/proc` 的存在性判断它是否已经消失。
+pub fn process_exists(pid: i32) -> bool {
+    process_start_time_ticks(pid).is_some()
+}
+
 pub fn user_id_from_uid(uid: i32) -> i32 {
     if uid >= 0 {
         uid / ANDROID_USER_ID_OFFSET
