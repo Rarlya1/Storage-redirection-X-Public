@@ -16,6 +16,12 @@
 
 旧版 `fuse_daemon_redirect_enabled` 不再读取；新建、迁移和管理端保存的配置只写入 `storage_backend_mode=auto`。
 
+## 会话归属与能力熔断
+
+- 每个 scoped 会话使用唯一的挂载源（`MountOption::FSName`，形如 `srx_fuse_redirect[<pid>]`），挂载完成后记录该挂载的挂载 ID。收尾时先确认挂载点最顶层仍是本次会话的挂载源；同路径已被新会话替换或已被摘除时跳过卸载，不会摘掉接管者的挂载。
+- 挂载归属按挂载源前缀判断，不按文件系统类型判断：内核 `mount(2)` 直挂的 scoped 挂载类型是 `fuse`，只有经 fusermount 回退时才出现 `fuse.srx`。
+- scoped 挂载启动或会话收尾连续失败达到预算（连续 3 次）才把整机能力写成 `unavailable`，本轮开机内随后回退 mount namespace；任意一次成功都会清零，daemon 启动会重置。能力快照包含 `state`、`reason` 与 `fail_count`（`schema=2`），管理端、WebUI 与诊断归档仍只读取 `state` 与 `reason`。
+
 ## 优点
 
 - FUSE 请求在文件操作开始时执行策略，通配、动态文件和只读排除不依赖挂载时的目录快照。
