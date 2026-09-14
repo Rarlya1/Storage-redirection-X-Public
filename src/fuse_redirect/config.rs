@@ -15,6 +15,21 @@ pub enum FuseCapability {
     Unavailable,
 }
 
+/// scoped 挂载连续失败达到该次数后，本轮开机内不再尝试 scoped 挂载。
+///
+/// 单次失败可能来自开机竞态、目标进程正在退出或挂载点标签尚未就绪等可恢复事件，直接把
+/// 整机能力锁成 `unavailable` 会让本轮开机剩余时间全部退回 namespace。这里用少量额外
+/// 尝试换取可恢复性，达到预算后才写入 `unavailable`。
+const SCOPED_MOUNT_FAILURE_BUDGET: u32 = 3;
+
+/// 能力快照内容。
+///
+/// `failure_count` 统计本轮开机内连续的 scoped 挂载与收尾失败次数，任意一次成功都会清零。
+struct FuseCapabilitySnapshot {
+    capability: FuseCapability,
+    failure_count: u32,
+}
+
 #[derive(Clone)]
 pub struct FuseRedirectConfig {
     pub package_name: String,
@@ -102,7 +117,8 @@ pub fn scoped_fuse_mount_roots_for_request<R: MountRequestFields + ?Sized>(
     let capability_available = match backend_mode {
         StorageBackendMode::Fuse => fuse_first_capability_available(),
         // Unknown 只表示设备探测尚未得到真实会话结果，允许首次请求进行一次实际
-        // scoped 挂载验证；失败后由 record_fuse_capability_result 锁定为 Unavailable。
+        // scoped 挂载验证；连续失败达到预算后由 record_fuse_capability_result 写成
+        // Unavailable。
         StorageBackendMode::Auto => match fuse_capability() {
             FuseCapability::Available => true,
             FuseCapability::Unknown => fuse_device_present(),
@@ -142,31 +158,42 @@ pub fn fuse_device_present() -> bool {
 
 /// 返回 daemon 最近一次记录的 FUSE 能力。
 ///
-/// 普通应用只读取这个原子替换的快照，不直接打开 `/dev/fuse`。快照缺失时保持
-/// `Unknown`，由规划层走保守的 namespace fallback 路径。
+/// 普通应用只读取这个原子替换的快照，不直接打开 `/dev/fuse`。快照缺失或来自其它开机时
+/// 保持 `Unknown`，由规划层走保守的 namespace fallback 路径。
 pub fn fuse_capability() -> FuseCapability {
-    let Ok(content) = std::fs::read_to_string(module_paths::FUSE_CAPABILITY_FILE) else {
-        return FuseCapability::Unknown;
-    };
+    read_fuse_capability_snapshot()
+        .map(|snapshot| snapshot.capability)
+        .unwrap_or(FuseCapability::Unknown)
+}
+
+/// 读取当前开机的能力快照；快照缺失、boot_id 不匹配或内容不可解析时返回 None。
+fn read_fuse_capability_snapshot() -> Option<FuseCapabilitySnapshot> {
+    let content = std::fs::read_to_string(module_paths::FUSE_CAPABILITY_FILE).ok()?;
     let current_boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|value| value.trim().to_string());
-    let snapshot_boot_id = content
-        .lines()
-        .find_map(|line| line.strip_prefix("boot_id="))
-        .map(str::trim);
-    if current_boot_id.as_deref() != snapshot_boot_id {
-        return FuseCapability::Unknown;
+    if current_boot_id.as_deref() != snapshot_field(&content, "boot_id") {
+        return None;
     }
-    match content
+    Some(FuseCapabilitySnapshot {
+        capability: match snapshot_field(&content, "state") {
+            Some("available") => FuseCapability::Available,
+            Some("unavailable") => FuseCapability::Unavailable,
+            _ => FuseCapability::Unknown,
+        },
+        failure_count: snapshot_field(&content, "fail_count")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0),
+    })
+}
+
+/// 从能力快照内容中读取一个 `key=value` 字段。
+fn snapshot_field<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    content
         .lines()
-        .find_map(|line| line.strip_prefix("state="))
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
         .map(str::trim)
-    {
-        Some("available") => FuseCapability::Available,
-        Some("unavailable") => FuseCapability::Unavailable,
-        _ => FuseCapability::Unknown,
-    }
 }
 
 pub fn fuse_capability_as_str(capability: FuseCapability) -> &'static str {
@@ -217,7 +244,11 @@ pub fn expand_namespace_fallback_rules(uid: i32, rules: &[String]) -> Vec<String
     expanded
 }
 
-fn write_fuse_capability_snapshot(capability: FuseCapability, reason: &str) -> FuseCapability {
+fn write_fuse_capability_snapshot(
+    capability: FuseCapability,
+    reason: &str,
+    failure_count: u32,
+) -> FuseCapability {
     let state = match capability {
         FuseCapability::Available => "available",
         FuseCapability::Unavailable => "unavailable",
@@ -227,7 +258,9 @@ fn write_fuse_capability_snapshot(capability: FuseCapability, reason: &str) -> F
         .ok()
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
-    let content = format!("schema=1\nboot_id={boot_id}\nstate={state}\nreason={reason}\n");
+    let content = format!(
+        "schema=2\nboot_id={boot_id}\nstate={state}\nreason={reason}\nfail_count={failure_count}\n"
+    );
     let path = std::path::Path::new(module_paths::FUSE_CAPABILITY_FILE);
     // 快照会被 daemon 与多个 scoped 会话子进程同时写入，固定 temp 名会让并发写入
     // 互相 rename 掉对方的临时文件，这里带上 pid 与自增序号保证唯一。
@@ -242,7 +275,12 @@ fn write_fuse_capability_snapshot(capability: FuseCapability, reason: &str) -> F
             error
         );
     } else {
-        log::info!("fuse capability snapshot state={} reason={}", state, reason);
+        log::info!(
+            "fuse capability snapshot state={} reason={} fail_count={}",
+            state,
+            reason,
+            failure_count
+        );
     }
     capability
 }
@@ -270,19 +308,71 @@ pub fn refresh_fuse_capability_snapshot(reason: &str) -> FuseCapability {
     } else {
         FuseCapability::Unavailable
     };
-    write_fuse_capability_snapshot(capability, reason)
+    write_fuse_capability_snapshot(capability, reason, 0)
 }
 
-/// 记录实际 scoped FUSE 挂载结果，失败时让后续请求立即走 namespace fallback。
+/// 记录实际 scoped FUSE 挂载结果，失败按预算累积，达到预算后让后续请求走 namespace fallback。
+///
+/// 计数只统计连续失败，任意一次成功都会清零；预算内失败写成 `Unknown`，下一次挂载请求会
+/// 重新尝试 scoped 挂载，达到 [`SCOPED_MOUNT_FAILURE_BUDGET`] 后才写成 `unavailable`。
 pub fn record_fuse_capability_result(available: bool, reason: &str) -> FuseCapability {
-    write_fuse_capability_snapshot(
-        if available {
-            FuseCapability::Available
-        } else {
-            FuseCapability::Unavailable
-        },
-        reason,
-    )
+    // 计数是读改写序列，而 daemon 会并发处理不同应用的挂载请求；用同目录锁文件串行化，
+    // 避免并发失败互相覆盖计数导致预算迟迟达不到。锁获取失败只降低计数精度，不影响写入。
+    let _lock = CapabilitySnapshotLock::acquire();
+    let failure_count = if available {
+        0
+    } else {
+        read_fuse_capability_snapshot()
+            .map(|snapshot| snapshot.failure_count)
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    let capability = if available {
+        FuseCapability::Available
+    } else if failure_count >= SCOPED_MOUNT_FAILURE_BUDGET {
+        FuseCapability::Unavailable
+    } else {
+        FuseCapability::Unknown
+    };
+    write_fuse_capability_snapshot(capability, reason, failure_count)
+}
+
+/// 能力快照的跨进程互斥锁。
+///
+/// daemon 按 pid 并发处理挂载请求，多个 scoped 会话子进程也会写同一份快照，因此失败计数
+/// 需要跨进程串行化。锁文件与快照同目录，关闭 fd 即释放锁。
+struct CapabilitySnapshotLock {
+    fd: libc::c_int,
+}
+
+impl CapabilitySnapshotLock {
+    fn acquire() -> Option<Self> {
+        let path = CString::new(format!("{}.lock", module_paths::FUSE_CAPABILITY_FILE)).ok()?;
+        // SAFETY: path 是以 NUL 结尾的合法路径，flags 与 mode 只用于创建打开锁文件。
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: fd 来自上面的 open，且在本次调用中尚未交给其它所有者。
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(Self { fd })
+    }
+}
+
+impl Drop for CapabilitySnapshotLock {
+    fn drop(&mut self) {
+        // SAFETY: fd 来自 CapabilitySnapshotLock::acquire，并且在此之后不再使用。
+        unsafe { libc::close(self.fd) };
+    }
 }
 
 fn fuse_first_capability_available() -> bool {
@@ -507,7 +597,7 @@ fn finish_failed_session(
     }
 
     // 挂载点仍由本次会话持有且延迟卸载也没能摘除，说明这次 scoped 会话确实无法收尾；
-    // 记录能力失败，让 Auto 后端后续请求稳定回退到 namespace。
+    // 记录能力失败，让 Auto 后端按失败预算决定后续是否继续尝试 scoped 挂载。
     record_fuse_capability_result(false, "scoped_session_end_error");
     log::warn!(
         "fuse redirect session ended with error mp={} app_exited={} err={}",
