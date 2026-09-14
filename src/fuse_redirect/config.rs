@@ -1,12 +1,9 @@
 use crate::config::StorageBackendMode;
 use crate::domain::PathMapping;
-use crate::platform::errno::last as last_errno;
 use crate::platform::{fs, module_paths, paths};
 use fuser::{MountOption, SessionACL};
 use std::ffi::CString;
-use std::io;
 use std::os::unix::fs::FileTypeExt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FuseCapability {
@@ -229,34 +226,18 @@ fn write_fuse_capability_snapshot(capability: FuseCapability, reason: &str) -> F
         .unwrap_or_default();
     let content = format!("schema=1\nboot_id={boot_id}\nstate={state}\nreason={reason}\n");
     let path = std::path::Path::new(module_paths::FUSE_CAPABILITY_FILE);
-    // 快照会被 daemon 与多个 scoped 会话子进程同时写入，固定 temp 名会让并发写入
-    // 互相 rename 掉对方的临时文件，这里带上 pid 与自增序号保证唯一。
-    let temp = capability_snapshot_temp_path(path);
-    let write_result = std::fs::write(&temp, content).and_then(|()| std::fs::rename(&temp, path));
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp);
-        log::warn!(
-            "fuse capability snapshot write failed state={} reason={} err={}",
-            state,
-            reason,
-            error
-        );
-    } else {
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, content).is_ok() && std::fs::rename(&temp, path).is_ok() {
         log::info!("fuse capability snapshot state={} reason={}", state, reason);
+    } else {
+        let _ = std::fs::remove_file(temp);
+        log::warn!(
+            "fuse capability snapshot write failed state={} reason={}",
+            state,
+            reason
+        );
     }
     capability
-}
-
-/// 生成能力快照的临时文件路径，供同目录下的原子替换使用。
-///
-/// 每次写入都使用独立文件名，避免 daemon 与 scoped 会话子进程并发写入时互相
-/// 覆盖临时文件，导致其中一方 rename 失败。
-fn capability_snapshot_temp_path(path: &std::path::Path) -> std::path::PathBuf {
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(format!(".{}.{}.tmp", std::process::id(), sequence));
-    std::path::PathBuf::from(temp)
 }
 
 /// 在 root daemon 或 companion 挂载路径中刷新能力快照。
@@ -385,12 +366,7 @@ pub fn mount_blocking_with_ready(
 
     loop {
         if background.guard.is_finished() {
-            // 会话线程先结束：此时应用可能已经退出，而应用退出会连带清掉它的挂载
-            // namespace 与这里的 scoped 挂载。必须先判断应用是否还活着，否则会把
-            // 应用退出、重启记成 scoped 会话失败，进而把整机 FUSE 能力锁成不可用。
-            let app_alive =
-                crate::platform::is_process_instance_alive(app_pid, app_start_time_ticks);
-            return finish_background_session(background, &mount_point, !app_alive);
+            return finish_background_session(background, &mount_point, false);
         }
         if !crate::platform::is_process_instance_alive(app_pid, app_start_time_ticks) {
             log::info!(
@@ -419,107 +395,19 @@ fn finish_background_session(
             );
             true
         }
-        Err(error) => finish_failed_session(mount_point, app_exited, &error),
-    }
-}
-
-/// 处理 scoped 会话收尾失败。
-///
-/// 挂载点被回收时 `umount` 必然失败：daemon 重新挂载会先摘除目标挂载点再终止旧服务
-/// 进程，应用退出时系统也会连带销毁它的挂载 namespace。此时 EINVAL/ENOENT/ENOTCONN
-/// 只说明挂载点已经不存在，应用仍在运行且挂载点仍有引用时则是 EBUSY，两者都只是收尾
-/// 事件，不能证明设备不支持 scoped 会话。能力快照是整机状态，一旦写成 unavailable，
-/// Auto 后端在本轮开机内不会再次尝试 scoped 挂载，因此只有挂载点仍在当前 namespace 且
-/// 延迟卸载也失败时才记录能力失败。
-fn finish_failed_session(mount_point: &str, app_exited: bool, error: &io::Error) -> bool {
-    let error_no = error.raw_os_error().unwrap_or_default();
-    if app_exited || is_already_unmounted_errno(error_no) {
-        log::info!(
-            "fuse redirect session ended mp={} app_exited={} err={}",
-            mount_point,
-            app_exited,
-            error
-        );
-        return true;
-    }
-
-    if detach_mount_point(mount_point) {
-        log::warn!(
-            "fuse redirect session detach ok mp={} app_exited={} err={}",
-            mount_point,
-            app_exited,
-            error
-        );
-        return true;
-    }
-
-    // 挂载点仍在本命名空间且延迟卸载也没能摘除，说明这次 scoped 会话确实无法收尾；
-    // 记录能力失败，让 Auto 后端后续请求稳定回退到 namespace。
-    record_fuse_capability_result(false, "scoped_session_end_error");
-    log::warn!(
-        "fuse redirect session ended with error mp={} app_exited={} err={}",
-        mount_point,
-        app_exited,
-        error
-    );
-    false
-}
-
-/// 判断 errno 是否表示挂载点已经不在当前挂载命名空间。
-///
-/// - EINVAL：`umount2` 要求目标仍是挂载点，重新挂载流程已用 `MNT_DETACH` 摘掉旧挂载时
-///   就会返回该错误；
-/// - ENOENT：挂载点路径已不存在；
-/// - ENOTCONN：挂载记录还在但 FUSE 服务已退出，等价于本次会话已经结束。
-fn is_already_unmounted_errno(error_no: i32) -> bool {
-    matches!(error_no, libc::EINVAL | libc::ENOENT | libc::ENOTCONN)
-}
-
-/// 用延迟卸载兜底清理会话挂载点。
-///
-/// 返回 true 表示挂载点已经不在当前命名空间：本次卸载成功，或系统（应用退出、挂载
-/// namespace 销毁）已经把它摘掉。
-fn detach_mount_point(mount_point: &str) -> bool {
-    // 只有挂载点上确实是本模块的 scoped FUSE 挂载才做延迟卸载；否则宁可保留告警，
-    // 也不能在收尾失败时误摘同路径上新挂载的其它文件系统。
-    if !is_scoped_fuse_mount_point(mount_point) {
-        return false;
-    }
-
-    let Ok(c_target) = CString::new(mount_point) else {
-        return false;
-    };
-    // SAFETY: c_target 是以 NUL 结尾的合法 C 字符串，并在调用期间保持存活。
-    if unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) } == 0 {
-        return true;
-    }
-    is_already_unmounted_errno(last_errno())
-}
-
-/// 判断挂载点当前承载的挂载是否本模块的 scoped FUSE 挂载。
-///
-/// 本模块的 scoped 挂载以 `fuse.srx` 为文件系统类型，通过挂载表即可与本机其它
-/// FUSE 挂载（例如系统媒体 FUSE）区分开。
-fn is_scoped_fuse_mount_point(mount_point: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return false;
-    };
-    let normalized = paths::normalize(mount_point);
-    content.lines().any(|line| {
-        let Some(separator) = line.find(" - ") else {
-            return false;
-        };
-        let mut fields = line[..separator].split_whitespace();
-        let target = fields.nth(4);
-        if !target.is_some_and(|value| paths::eq_ignore_case(&paths::normalize(value), &normalized))
-        {
-            return false;
+        Err(error) => {
+            // 会话异常结束通常意味着当前内核、挂载 namespace 或 FUSE 修复链路
+            // 不支持该 scoped 会话；让 Auto 后端后续请求稳定回退到 namespace。
+            record_fuse_capability_result(false, "scoped_session_end_error");
+            log::warn!(
+                "fuse redirect session ended with error mp={} app_exited={} err={}",
+                mount_point,
+                app_exited,
+                error
+            );
+            false
         }
-        line[separator + 3..]
-            .split_whitespace()
-            .next()
-            .is_some_and(|fs_type| fs_type == "fuse.srx")
-    })
+    }
 }
 
 pub(super) fn fuse_mount_point(config: &FuseRedirectConfig, user_id: i32) -> String {

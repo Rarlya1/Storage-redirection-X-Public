@@ -693,20 +693,11 @@ fn normalize_redirect_dir_metadata(path: &str, mode: mode_t, owner: Option<&Redi
 
     let ret = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     if ret != 0 {
-        let error_no = current_errno();
-        // 共享存储的可见路径 `/storage/emulated/<user>` 由系统 MediaProvider 的 FUSE
-        // 承载，`/data/media/<user>/Android/data` 等目录由 media_rw 持有，应用进程对
-        // 它们 chmod 只会得到 EPERM/EACCES/EROFS。这类结果与下方 chown 的预期失败一致，
-        // 降级为 debug，避免系统盘符噪音掩盖真正的元数据修复失败。
-        if matches!(error_no, libc::EPERM | libc::EACCES | libc::EROFS) {
-            log::debug!(
-                "redirect dir chmod skipped path={} errno={}",
-                path,
-                error_no
-            );
-        } else {
-            log::warn!("redirect dir chmod failed path={} errno={}", path, error_no);
-        }
+        log::warn!(
+            "redirect dir chmod failed path={} errno={}",
+            path,
+            current_errno()
+        );
     }
 
     let Some(owner) = owner else {
