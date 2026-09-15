@@ -1889,7 +1889,7 @@
         "放行应用私有目录",
         "applicationPrivate",
         privatePaths.every((path) => (profile.allowed_real_paths || []).includes(path)),
-        "允许访问 Android/data、Android/media 和 Android/obb 下该应用的目录",
+        "自动处理应用私有目录(Android/data|media|obb/com.example.app)的允许路径规则",
       );
     }
     html += switchRow(

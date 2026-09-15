@@ -18,7 +18,7 @@ env:
 
 jobs:
   quality:
-    if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'Rarlya1/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -62,7 +62,7 @@ jobs:
           ./scripts/validate-code-quality.ps1 -BaseRef HEAD^ -Ref HEAD
 
   prepare:
-    if: github.repository == 'z1298808165/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'Rarlya1/Storage-redirection-X-Public' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
