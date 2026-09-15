@@ -72,6 +72,16 @@ internal object SrxConfigNormalizer {
         .getOrElse { incoming }
   }
 
+  fun applicationPrivatePaths(packageName: String): List<String> =
+      listOf(
+          "Android/data/$packageName",
+          "Android/media/$packageName",
+          "Android/obb/$packageName",
+      )
+
+  fun isApplicationPrivatePath(path: String, packageName: String): Boolean =
+      applicationPrivatePaths(packageName).contains(path.trim())
+
   fun normalizeAppConfig(config: AppConfig): AppConfig {
     return config.copy(
         users =

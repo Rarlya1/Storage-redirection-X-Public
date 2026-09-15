@@ -338,6 +338,20 @@ class SrxViewModel(
     if (state.dashboard.globalConfig.appConfigAutoSave) scheduleConfigSave(app.packageName, updated)
   }
 
+  fun setApplicationPrivateAccess(packageName: String, enabled: Boolean) {
+    if (!isSafePackageName(packageName)) return
+    val privatePaths = SrxConfigNormalizer.applicationPrivatePaths(packageName)
+    updateProfile { profile ->
+      val paths =
+          if (enabled) {
+            (profile.allowedRealPaths + privatePaths).distinct().sorted()
+          } else {
+            profile.allowedRealPaths.filterNot { it in privatePaths }
+          }
+      profile.copy(allowedRealPaths = paths)
+    }
+  }
+
   fun addAllowedPath(value: String) =
       updateListPath(value, allowRuleSyntax = true) { profile, path ->
         profile.copy(allowedRealPaths = (profile.allowedRealPaths + path).distinct().sorted())

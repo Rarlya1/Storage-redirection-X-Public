@@ -572,6 +572,9 @@ private fun SrxManagerApp(
                               onSaveTemplate = viewModel::saveCurrentConfigAsTemplate,
                               onApplyTemplate = viewModel::applyTemplateToCurrentApp,
                               onProfileChange = viewModel::updateProfile,
+                              onSetApplicationPrivateAccess = { enabled ->
+                                viewModel.setApplicationPrivateAccess(currentApp.packageName, enabled)
+                              },
                               onAddAllowed = viewModel::addAllowedPath,
                               onAddSandbox = viewModel::addSandboxPath,
                               onUpdateAllowed = viewModel::updateAllowedPath,

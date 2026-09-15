@@ -41,6 +41,7 @@ import org.srx.manager.data.AppConfig
 import org.srx.manager.data.ConfigTemplate
 import org.srx.manager.data.InstalledApp
 import org.srx.manager.data.LogEntry
+import org.srx.manager.data.SrxConfigNormalizer
 import org.srx.manager.data.UiPreferences
 import org.srx.manager.data.UserProfile
 import org.srx.manager.floatingGlassPanel
@@ -228,6 +229,7 @@ internal fun AppConfigScreen(
     onSaveTemplate: (String) -> Unit,
     onApplyTemplate: (String) -> Unit,
     onProfileChange: ((UserProfile) -> UserProfile) -> Unit,
+    onSetApplicationPrivateAccess: (Boolean) -> Unit,
     onAddAllowed: (String) -> Unit,
     onAddSandbox: (String) -> Unit,
     onUpdateAllowed: (String, String) -> Unit,
@@ -311,6 +313,17 @@ internal fun AppConfigScreen(
                 checked = profile.enabled,
                 onCheckedChange = { checked -> onProfileChange { it.copy(enabled = checked) } },
             )
+            if (profile.enabled) {
+              CompactSwitchRow(
+                  title = "放行应用私有目录",
+                  summary = "允许访问 Android/data、Android/media 和 Android/obb 下该应用的目录",
+                  checked =
+                      SrxConfigNormalizer.applicationPrivatePaths(app.packageName).all {
+                        it in profile.allowedRealPaths
+                      },
+                  onCheckedChange = onSetApplicationPrivateAccess,
+              )
+            }
             CompactSwitchRow(
                 title = "仅映射模式",
                 summary = "仅应用显式路径映射；未命中映射时保持原路径",
@@ -335,7 +348,10 @@ internal fun AppConfigScreen(
           PathEditorCard(
               title = "允许路径",
               emptyHint = "允许路径可直接访问；仅支持共享存储根下的相对路径；! 可排除子路径，* 和 ? 在默认方案下会退化匹配",
-              values = profile.allowedRealPaths,
+              values =
+                  profile.allowedRealPaths.filterNot {
+                    SrxConfigNormalizer.isApplicationPrivatePath(it, app.packageName)
+                  },
               addLabel = "添加允许路径",
               placeholder = "路径",
               userId = state.selectedUser,

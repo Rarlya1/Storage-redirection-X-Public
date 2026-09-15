@@ -13,6 +13,23 @@ class SrxConfigNormalizerTest {
   }
 
   @Test
+  fun applicationPrivatePathsUsePackageNameAndAreRecognized() {
+    val packageName = "com.example.app"
+    val paths = SrxConfigNormalizer.applicationPrivatePaths(packageName)
+
+    assertEquals(
+        listOf(
+            "Android/data/com.example.app",
+            "Android/media/com.example.app",
+            "Android/obb/com.example.app",
+        ),
+        paths,
+    )
+    assertTrue(SrxConfigNormalizer.isApplicationPrivatePath(paths[0], packageName))
+    assertFalse(SrxConfigNormalizer.isApplicationPrivatePath("Android/data/other.app", packageName))
+  }
+
+  @Test
   fun normalizeGlobalConfigSanitizesAutoTemplateId() {
     val normalized =
         SrxConfigNormalizer.normalizeGlobalConfig(

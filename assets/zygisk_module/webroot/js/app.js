@@ -1883,6 +1883,15 @@
       profile.enabled === true,
       "开启后将对此应用执行存储重定向",
     );
+    if (profile.enabled === true && !isTemplateMode && applicationPrivatePaths(packageName).length) {
+      const privatePaths = applicationPrivatePaths(packageName);
+      html += switchRow(
+        "放行应用私有目录",
+        "applicationPrivate",
+        privatePaths.every((path) => (profile.allowed_real_paths || []).includes(path)),
+        "允许访问 Android/data、Android/media 和 Android/obb 下该应用的目录",
+      );
+    }
     html += switchRow(
       "仅映射模式",
       "mappingOnly",
@@ -1901,7 +1910,9 @@
     html += "</div>";
 
     // 允许路径，包括以 ! 表示的排除规则。
-    const allowRules = getAllowedRules(profile);
+    const allowRules = getAllowedRules(profile).filter(
+      (path) => !isApplicationPrivatePath(path, packageName),
+    );
     html +=
       '<div class="config-group"><div class="config-group-header"><span class="config-group-title">允许路径</span><button class="icon-btn icon-btn-sm icon-btn-add add-allow-btn" type="button" aria-label="添加允许路径" title="添加允许路径">' +
       iconHtml("plus") +
@@ -2762,7 +2773,13 @@
       toggle.addEventListener("click", () => {
         toggle.classList.toggle("on");
         collectCurrentProfile(users);
-        if (toggle.dataset.key === "readOnly") {
+        if (toggle.dataset.key === "enable") {
+          renderAppConfig(
+            packageName,
+            { users },
+            isTemplateEditorActive() ? { mode: "template" } : undefined,
+          );
+        } else if (toggle.dataset.key === "readOnly") {
           const key = appReadOnlyEditorKey(packageName);
           const profile = getProfile(users);
           if (toggle.classList.contains("on")) {
@@ -2771,6 +2788,17 @@
             State.readOnlyEditorKeys.delete(key);
             profile.read_only_paths = [];
           }
+          renderAppConfig(
+            packageName,
+            { users },
+            isTemplateEditorActive() ? { mode: "template" } : undefined,
+          );
+        } else if (toggle.dataset.key === "applicationPrivate") {
+          setApplicationPrivateAccess(
+            getProfile(users),
+            packageName,
+            toggle.classList.contains("on"),
+          );
           renderAppConfig(
             packageName,
             { users },
@@ -3084,6 +3112,27 @@
       ? "template:" + (State.templateEditor?.id || packageName || "")
       : "app:" + (packageName || "");
     return owner + ":user:" + getActiveConfigUserId();
+  }
+
+  function applicationPrivatePaths(packageName) {
+    if (!packageName || packageName === "__template__") return [];
+    return [
+      "Android/data/" + packageName,
+      "Android/media/" + packageName,
+      "Android/obb/" + packageName,
+    ];
+  }
+  function isApplicationPrivatePath(path, packageName) {
+    return applicationPrivatePaths(packageName).includes(String(path || "").trim());
+  }
+  function setApplicationPrivateAccess(profile, packageName, enabled) {
+    const privatePaths = applicationPrivatePaths(packageName);
+    const current = Array.isArray(profile.allowed_real_paths)
+      ? profile.allowed_real_paths
+      : [];
+    profile.allowed_real_paths = enabled
+      ? [...new Set([...current, ...privatePaths])]
+      : current.filter((path) => !privatePaths.includes(String(path || "").trim()));
   }
 
   function getAllowedRules(profile) {
