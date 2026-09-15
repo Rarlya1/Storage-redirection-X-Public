@@ -1883,7 +1883,11 @@
       profile.enabled === true,
       "开启后将对此应用执行存储重定向",
     );
-    if (profile.enabled === true && !isTemplateMode && applicationPrivatePaths(packageName).length) {
+    if (
+      profile.enabled === true &&
+      !isTemplateMode &&
+      applicationPrivatePaths(packageName).length
+    ) {
       const privatePaths = applicationPrivatePaths(packageName);
       html += switchRow(
         "放行应用私有目录",
@@ -3127,9 +3131,7 @@
   }
   function setApplicationPrivateAccess(profile, packageName, enabled) {
     const privatePaths = applicationPrivatePaths(packageName);
-    const current = Array.isArray(profile.allowed_real_paths)
-      ? profile.allowed_real_paths
-      : [];
+    const current = Array.isArray(profile.allowed_real_paths) ? profile.allowed_real_paths : [];
     profile.allowed_real_paths = enabled
       ? [...new Set([...current, ...privatePaths])]
       : current.filter((path) => !privatePaths.includes(String(path || "").trim()));
