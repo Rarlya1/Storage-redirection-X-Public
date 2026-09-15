@@ -13,7 +13,7 @@ class SrxConfigNormalizerTest {
   }
 
   @Test
-  fun applicationPrivatePathsUsePackageNameAndAreRecognized() {
+  fun applicationPrivatePathsUsePackageName() {
     val packageName = "com.example.app"
     val paths = SrxConfigNormalizer.applicationPrivatePaths(packageName)
 
